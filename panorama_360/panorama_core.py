@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Copyright (C) 2026 Marco Sumari Tellez and IngeTrazo contributors.
+# Copyright (C) 2026 D.S (Archviz360).
 """Native 360-degree image export used by :mod:`plugins.panorama_360`.
 
 Six ordinary IngeTrazo 2D exports are captured around a document camera and
@@ -41,8 +42,9 @@ def _set_view(camera, eye: QVector3D, forward: QVector3D,
 
 
 def render_cube_faces(viewport, camera: dict, size: int,
-                      overlays: bool = False) -> dict:
-    """Render six 90° faces with IngeTrazo's own 2D-image renderer.
+                      overlays: bool = False,
+                      auto_level: bool = True) -> dict:
+    """Render six 90-degree faces with IngeTrazo's own 2D-image renderer.
 
     The live viewport camera is restored exactly before returning, even when
     a graphics-driver error interrupts a face.  ``camera`` is one cleaned
@@ -58,7 +60,14 @@ def render_cube_faces(viewport, camera: dict, size: int,
     saved = {name: getattr(live, name) for name in fields}
     saved["target"], saved["up"] = QVector3D(live.target), QVector3D(live.up)
     eye = QVector3D(*camera["pos"])
-    forward = direction(camera).normalized()
+    if auto_level:
+        # A 360 panorama has no ordinary frame edge to hide a tilted horizon.
+        # Keep its equator parallel to the model's XY plane regardless of the
+        # source viewport pitch; heading still determines the centre/seam.
+        heading = math.radians(camera["heading"])
+        forward = QVector3D(math.sin(heading), math.cos(heading), 0.0)
+    else:
+        forward = direction(camera).normalized()
     world_up = QVector3D(0.0, 0.0, 1.0)
     right = QVector3D.crossProduct(forward, world_up)
     if right.lengthSquared() < 1e-12:
@@ -87,7 +96,7 @@ def render_cube_faces(viewport, camera: dict, size: int,
 
 
 def _rgba_array(image):
-    """A detached ``height × width × 4`` uint8 array from a QImage."""
+    """A detached ``height x width x 4`` uint8 array from a QImage."""
     import numpy as np
     from PySide6.QtGui import QImage
     image = image.convertToFormat(QImage.Format_RGBA8888)
@@ -223,6 +232,7 @@ def manifest(camera: dict, projection: str, width: int, fmt: str) -> dict:
         "projection": projection,
         "width": w, "height": h,
         "format": fmt,
+        "auto_level": True,
         "camera": clean_camera(camera),
         "cube_faces": ["front", "right", "back", "left", "up", "down"]
                       if projection in CUBE_PROJECTIONS else None,

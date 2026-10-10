@@ -22,6 +22,7 @@ D.S (Archviz360)
 - Equirectangular 360° output at 2K–16K
 - PNG and JPEG output
 - GPano metadata in JPEG panoramas
+- Automatic horizon leveling for straight, upright panoramas
 - Cubemap horizontal strip and 4×3 cross layouts
 - Six-face cubemap ZIP export
 - Restores the original viewport after capturing the panorama
@@ -73,6 +74,8 @@ Restart IngeTrazo afterward.
 6. Press **Export selected 360…**.
 
 Equirectangular exports are standard 2:1 images—for example, 4096×2048.
+The horizon is leveled automatically during export, even if the saved camera
+was looking upward or downward.
 
 ## How it works
 

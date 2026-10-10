@@ -1,11 +1,11 @@
-﻿{
+{
   "name": "IngeTrazo Native 360 Export",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "host": "IngeTrazo",
   "minimum_host_version": "0.5.7",
   "extension_api": 2,
   "entrypoint": "panorama_360/__init__.py",
   "license": "GPL-3.0-or-later",
-  "external_renderer_required": false
-  "author": "D.S (Archviz360)",
+  "external_renderer_required": false,
+  "author": "D.S (Archviz360)"
 }

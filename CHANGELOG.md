@@ -1,4 +1,12 @@
-﻿# Changelog
+# Changelog
+
+## 2.1.0
+
+- Fixed corrupted degree signs, ellipses, multiplication signs, and dashes in
+  the panel by using encoding-safe interface text.
+- Removed obsolete controls that left stray or confusing labels.
+- Simplified the panel to settings supported by the native renderer.
+- Added automatic horizon leveling to every panorama capture.
 
 ## 1.0.0
 

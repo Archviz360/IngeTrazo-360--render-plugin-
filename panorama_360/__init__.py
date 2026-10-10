@@ -1,10 +1,11 @@
-﻿# SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-License-Identifier: GPL-3.0-or-later
 # Copyright (C) 2026 Marco Sumari Tellez and IngeTrazo contributors.
-"""360Â° image export â€” persistent cameras and native panoramic rendering.
+# Copyright (C) 2026 D.S (Archviz360).
+"""360-degree image export - persistent cameras and native rendering.
 
 The panel creates any number of cameras in the model, places/aims them with
 snapping, previews their direction in the viewport and exports a selected
-camera or a whole batch. Six 90Â° views from IngeTrazo's own 2D exporter are
+camera or a whole batch. Six 90-degree views from the native 2D exporter are
 stitched into a true equirectangular panorama; no external renderer is used.
 """
 from __future__ import annotations
@@ -33,10 +34,10 @@ from views.fold_section import FoldSection, narrow, wrapping_form
 
 _SETTINGS = "panorama360/"
 _PROJECTION_LABELS = (
-    ("equirectangular", "Equirectangular 360Â° (2:1)"),
-    ("cubemap_faces", "Cube map â€” six-face ZIP"),
-    ("cubemap_strip", "Cube map â€” horizontal strip"),
-    ("cubemap_cross", "Cube map â€” 4 Ã— 3 cross"),
+    ("equirectangular", "Equirectangular 360 deg (2:1)"),
+    ("cubemap_faces", "Cube map - six-face ZIP"),
+    ("cubemap_strip", "Cube map - horizontal strip"),
+    ("cubemap_cross", "Cube map - 4 x 3 cross"),
 )
 
 
@@ -92,11 +93,8 @@ class PanoramaPanel(QWidget):
     def __init__(self, app) -> None:
         super().__init__()
         self.app = app
-        self._found = None
         self._queue = []
         self._result = None
-        self._cube_face = 0
-        self._cancelled = False
         self._view_pick = None
         self._picking = None
         self._build_ui()
@@ -127,7 +125,7 @@ class PanoramaPanel(QWidget):
         add = QPushButton(tr("+ From view"))
         add.setToolTip(tr("Create a 360 camera at the current viewport eye"))
         add.clicked.connect(self._add_from_view)
-        place = QPushButton(tr("+ Placeâ€¦"))
+        place = QPushButton(tr("+ Place..."))
         place.setToolTip(tr("Click a floor point; eye height is added"))
         place.clicked.connect(lambda: self._begin_pick("new"))
         row.addWidget(add)
@@ -156,14 +154,16 @@ class PanoramaPanel(QWidget):
         self._heading.setRange(0.0, 359.9)
         self._heading.setDecimals(1)
         self._heading.setWrapping(True)
-        self._heading.setSuffix(" Â°")
-        self._heading.setToolTip(tr("0Â° north, 90Â° east"))
+        self._heading.setSuffix(" deg")
+        self._heading.setToolTip(tr("0 deg north, 90 deg east"))
         self._heading.editingFinished.connect(self._edited)
         form.addRow(tr("Heading:"), self._heading)
         self._tilt = QDoubleSpinBox()
         self._tilt.setRange(-90.0, 90.0)
         self._tilt.setDecimals(1)
-        self._tilt.setSuffix(" Â°")
+        self._tilt.setSuffix(" deg")
+        self._tilt.setToolTip(tr(
+            "Used by Look through; 360 export levels the horizon automatically"))
         self._tilt.editingFinished.connect(self._edited)
         form.addRow(tr("Tilt:"), self._tilt)
         self._eye_height = QDoubleSpinBox()
@@ -174,9 +174,9 @@ class PanoramaPanel(QWidget):
         self._eye_height.setSuffix(" m")
         form.addRow(tr("Placement eye height:"), self._eye_height)
         row = QHBoxLayout()
-        move = QPushButton(tr("Moveâ€¦"))
+        move = QPushButton(tr("Move..."))
         move.clicked.connect(lambda: self._begin_pick("move"))
-        aim = QPushButton(tr("Aimâ€¦"))
+        aim = QPushButton(tr("Aim..."))
         aim.clicked.connect(lambda: self._begin_pick("aim"))
         look = QPushButton(tr("Look through"))
         look.clicked.connect(self._look_through)
@@ -220,77 +220,25 @@ class PanoramaPanel(QWidget):
         rrow.addWidget(self._resolution, 1)
         rrow.addWidget(self._size)
         form.addRow(tr("Resolution:"), rrow)
-        self._engine = QComboBox()
-        self._engine.addItem(tr("IngeTrazo native renderer"), "native")
-        self._engine.setEnabled(False)
-        form.addRow(tr("Engine:"), self._engine)
-        self._quality = QComboBox()
-        self._quality.addItem(tr("Viewport quality"))
-        self._quality.setEnabled(False)
-        form.addRow(tr("Quality:"), self._quality)
         self._format = QComboBox()
         for label, key in (("PNG", "png"), ("JPEG", "jpeg")):
             self._format.addItem(label, key)
         self._set_combo(self._format, settings.value(_SETTINGS + "format", "png"))
-        self._format.currentIndexChanged.connect(self._format_changed)
         form.addRow(tr("Format:"), self._format)
-        self._depth = QComboBox()
-        form.addRow(tr("Color depth:"), self._depth)
-        self._transparent = QCheckBox(tr("Transparent background"))
-        self._transparent.setChecked(False)
-        self._transparent.setEnabled(False)
-        form.addRow(self._transparent)
-        self._ground = QCheckBox(tr("Ground that catches shadows"))
-        self._ground.setChecked(str(settings.value(_SETTINGS + "ground", "1")) != "0")
-        self._ground.setVisible(False)
-        form.addRow(self._ground)
+        self._auto_level = QCheckBox(tr("Auto-level horizon (always on)"))
+        self._auto_level.setChecked(True)
+        self._auto_level.setEnabled(False)
+        self._auto_level.setToolTip(tr(
+            "Keeps the panorama horizon horizontal even if the viewport "
+            "camera was looking up or down"))
+        form.addRow(self._auto_level)
         self._metadata = QCheckBox(tr("Write metadata sidecar"))
         self._metadata.setChecked(str(settings.value(_SETTINGS + "metadata", "1")) != "0")
         form.addRow(self._metadata)
-        self._blend = QCheckBox(tr("Compatibility setting"))
-        self._blend.setChecked(False)
-        self._blend.setVisible(False)
-        form.addRow(self._blend)
         lay.addWidget(sec)
-
-        sec = FoldSection(tr("VR and fisheye"), _SETTINGS + "open_advanced")
-        form = wrapping_form(sec.body)
-        self._fov = QDoubleSpinBox()
-        self._fov.setRange(1.0, 360.0)
-        self._fov.setValue(float(settings.value(_SETTINGS + "fisheye_fov", 180.0)))
-        self._fov.setSuffix(" Â°")
-        form.addRow(tr("Fisheye field of view:"), self._fov)
-        self._lens = QDoubleSpinBox()
-        self._lens.setRange(0.1, 1000.0)
-        self._lens.setDecimals(1)
-        self._lens.setValue(float(settings.value(_SETTINGS + "fisheye_lens", 10.5)))
-        self._lens.setSuffix(" mm")
-        form.addRow(tr("Fisheye lens:"), self._lens)
-        self._eyes = QDoubleSpinBox()
-        self._eyes.setRange(0.0, 1.0)
-        self._eyes.setDecimals(3)
-        self._eyes.setSingleStep(0.005)
-        self._eyes.setValue(float(settings.value(_SETTINGS + "eye_separation", 0.065)))
-        self._eyes.setSuffix(" m")
-        form.addRow(tr("Stereo eye separation:"), self._eyes)
-        self._pole = QCheckBox(tr("Stereo pole merge"))
-        self._pole.setChecked(str(settings.value(_SETTINGS + "pole_merge", "1")) != "0")
-        form.addRow(self._pole)
-        self._exposure = QDoubleSpinBox()
-        self._exposure.setRange(-10.0, 10.0)
-        self._exposure.setDecimals(1)
-        self._exposure.setSingleStep(0.5)
-        self._exposure.setValue(float(settings.value(_SETTINGS + "exposure", -0.6)))
-        self._exposure.setSuffix(" EV")
-        form.addRow(tr("Exposure:"), self._exposure)
-        lay.addWidget(sec)
-        sec.setVisible(False)
 
         self._export_settings = (
-            self._projection, self._resolution, self._engine, self._quality,
-            self._format, self._depth, self._transparent, self._ground,
-            self._metadata, self._blend, self._fov, self._lens, self._eyes,
-            self._pole, self._exposure,
+            self._projection, self._resolution, self._format, self._metadata,
         )
 
         sec = FoldSection(tr("Export"), _SETTINGS + "open_export")
@@ -304,16 +252,12 @@ class PanoramaPanel(QWidget):
         self._where = QLabel()
         self._where.setWordWrap(True)
         box.addWidget(self._where)
-        self._go = QPushButton(tr("Export selected 360â€¦"))
+        self._go = QPushButton(tr("Export selected 360..."))
         self._go.clicked.connect(self._export_selected)
-        self._all = QPushButton(tr("Export all camerasâ€¦"))
+        self._all = QPushButton(tr("Export all cameras..."))
         self._all.clicked.connect(self._export_all)
-        self._cancel = QPushButton(tr("Cancel export"))
-        self._cancel.clicked.connect(self._cancel_export)
-        self._cancel.setVisible(False)
         box.addWidget(self._go)
         box.addWidget(self._all)
-        box.addWidget(self._cancel)
         self._bar = QProgressBar()
         self._bar.setRange(0, 1000)
         self._bar.setVisible(False)
@@ -325,9 +269,8 @@ class PanoramaPanel(QWidget):
         box.addWidget(self._status)
         lay.addWidget(sec)
         lay.addStretch(1)
-        narrow(self._name, self._projection, self._resolution, self._engine,
-               self._quality, self._format, self._go, self._all, self._status)
-        self._format_changed()
+        narrow(self._name, self._projection, self._resolution, self._format,
+               self._go, self._all, self._status)
         self._projection_changed()
         self._update_renderer_label()
 
@@ -456,7 +399,7 @@ class PanoramaPanel(QWidget):
                    "aim": tr("Click where the camera looks")}
         self.app.viewport.set_active_tool(_pick_tool(
             prompts[purpose], self._picked, self._end_pick))
-        self.app.window.statusBar().showMessage(prompts[purpose] + " â€” " + tr("Esc cancels"))
+        self.app.window.statusBar().showMessage(prompts[purpose] + " - " + tr("Esc cancels"))
         self.app.viewport.setFocus()
 
     def _picked(self, point):
@@ -490,42 +433,22 @@ class PanoramaPanel(QWidget):
 
     # ---- Settings ---------------------------------------------------------
     def _projection_changed(self):
-        self._engine.setEnabled(False)
-        self._quality.setEnabled(False)
         self._update_size_label()
-        self._format_changed()
 
     def _update_size_label(self):
         key = self._projection.currentData()
         width = int(self._resolution.currentData() or 4096)
         w, h = pano.dimensions(key, width)
         suffix = tr("final") if key not in pano.CUBE_PROJECTIONS else tr("face / final")
-        self._size.setText(f"{w} Ã— {h} px {suffix}")
-
-    def _format_changed(self):
-        key = self._format.currentData() or "png"
-        old = self._depth.currentData()
-        self._depth.clear()
-        for depth in pano.FORMATS[key]["depths"]:
-            self._depth.addItem(f"{depth}-bit", depth)
-        i = self._depth.findData(old)
-        self._depth.setCurrentIndex(max(0, i))
-        self._transparent.setEnabled(False)
-        packed = self._projection.currentData() in ("cubemap_strip", "cubemap_cross")
-        if packed and key in ("exr", "hdr"):
-            self._format.setCurrentIndex(self._format.findData("png"))
+        self._size.setText(f"{w} x {h} px {suffix}")
 
     def _remember(self):
         s = QSettings()
         values = {
             "projection": self._projection.currentData(),
-            "width": self._resolution.currentData(), "engine": self._engine.currentData(),
-            "quality": self._quality.currentIndex(), "format": self._format.currentData(),
-            "transparent": int(self._transparent.isChecked()),
-            "ground": int(self._ground.isChecked()), "metadata": int(self._metadata.isChecked()),
-            "blend": int(self._blend.isChecked()), "fisheye_fov": self._fov.value(),
-            "fisheye_lens": self._lens.value(), "eye_separation": self._eyes.value(),
-            "pole_merge": int(self._pole.isChecked()), "exposure": self._exposure.value(),
+            "width": self._resolution.currentData(),
+            "format": self._format.currentData(),
+            "metadata": int(self._metadata.isChecked()),
             "eye_height": self._eye_height.value(),
         }
         for key, value in values.items():
@@ -582,14 +505,13 @@ class PanoramaPanel(QWidget):
         self._remember()
         self._queue = list(jobs)
         self._result = None
-        self._cancelled = False
         self._set_running(True)
         QApplication.setOverrideCursor(Qt.WaitCursor)
         try:
             total = len(self._queue)
             for index, (camera, destination) in enumerate(self._queue, 1):
                 self._status.setText(tr(
-                    "Rendering {name} with IngeTrazoâ€¦", name=camera["name"]))
+                    "Rendering {name} with IngeTrazo...", name=camera["name"]))
                 QApplication.processEvents()
                 self._native_export(camera, Path(destination), index, total)
                 self._result = Path(destination)
@@ -614,7 +536,7 @@ class PanoramaPanel(QWidget):
         base = (job_index - 1) / max(job_total, 1)
         span = 1.0 / max(job_total, 1)
         faces = pano.render_cube_faces(self.app.viewport, camera, face_size,
-                                       overlays=False)
+                                       overlays=False, auto_level=True)
         self._bar.setValue(int((base + span * 0.35) * 1000))
         destination.parent.mkdir(parents=True, exist_ok=True)
         fmt = self._format.currentData()
@@ -675,17 +597,12 @@ class PanoramaPanel(QWidget):
 
     def _set_running(self, running):
         self._bar.setVisible(running)
-        self._cancel.setVisible(False)
         self._go.setVisible(not running)
         self._all.setVisible(not running)
         for widget in self._export_settings:
             widget.setEnabled(not running)
         if not running:
             self._projection_changed()
-
-    def _cancel_export(self):
-        self._cancelled = True
-        self._queue.clear()
 
     def _open_result(self, _link=None):
         if self._result is not None:
@@ -748,10 +665,9 @@ def draw_cameras(panel, viewport, painter):
 def setup(app) -> None:
     panel = PanoramaPanel(app)
     dock = app.add_panel(tr("360 Export"), panel)
-    app.add_menu_action(tr("Export 360 imagesâ€¦"), lambda: app.show_panel(dock),
+    app.add_menu_action(tr("Export 360 images..."), lambda: app.show_panel(dock),
                         tip=tr("Create panorama cameras and export immersive images."))
     app.on_document_changed(panel.refresh)
     app.add_overlay(lambda vp, painter: draw_cameras(panel, vp, painter))
     app.add_pickable(panel.pick_camera, on_select=panel.camera_picked,
                      delete=panel.delete_camera_at)
-

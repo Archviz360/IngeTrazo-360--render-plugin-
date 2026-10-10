@@ -1,4 +1,4 @@
-﻿param()
+param()
 
 $ErrorActionPreference = "Stop"
 $source = Join-Path $PSScriptRoot "panorama_360"
