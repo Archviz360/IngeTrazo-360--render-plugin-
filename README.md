@@ -8,6 +8,10 @@ The extension captures six 90-degree views around a persistent camera and
 stitches them into a standard 2:1 equirectangular image suitable for panorama
 viewers, websites, social platforms, and VR tours.
 
+## Author
+D.S (Archviz360)
+
+
 ## Features
 
 - Persistent 360 cameras saved inside the `.igz` document

@@ -7,4 +7,5 @@
   "entrypoint": "panorama_360/__init__.py",
   "license": "GPL-3.0-or-later",
   "external_renderer_required": false
+  "author": "D.S (Archviz360)",
 }
