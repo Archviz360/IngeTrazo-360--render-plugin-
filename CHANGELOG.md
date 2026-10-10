@@ -2,7 +2,8 @@
 
 ## 2.2.0
 
-- Added the supplied Archviz360 logo as the 360 Export button icon.
+- Added the supplied high-contrast red Archviz360 logo as the 360 Export
+  button icon.
 - Added an independent toolbar that can be moved, floated, or docked on any
   side of the IngeTrazo window.
 - The toolbar button opens and focuses the 360 Export panel.
