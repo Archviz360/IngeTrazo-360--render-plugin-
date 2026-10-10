@@ -1,3 +1,9 @@
+<img width="45" height="45" alt ="IngeTrazo_360_AT_icon_cutout" src="https://github.com/user-attachments/assets/75f05633-f2ce-499a-a79f-6167ac87dcd8" />
+
+<img width="2240" height="1120" alt="360-Camera-1-create-a-logo-for-360-render-plugin-there-shall-be" src="https://github.com/user-attachments/assets/773c7f63-3a79-4773-a386-6cf3e75bfebd" />
+
+
+
 # IngeTrazo Native 360 Export
 
 A native 360-degree panorama exporter for **IngeTrazo**. It uses
@@ -87,3 +93,5 @@ and combined into a seamless spherical projection.
 ## License
 
 GNU General Public License v3.0 or later. See [LICENSE](LICENSE).
+
+## step guide
