@@ -8,4 +8,4 @@ New-Item -ItemType Directory -Path $destination -Force | Out-Null
 Copy-Item (Join-Path $source "*") $destination -Recurse -Force
 Write-Host "Installed IngeTrazo Native 360 Export to:"
 Write-Host $destination
-Write-Host "Restart IngeTrazo, then open Extensions > Export 360 images."
+Write-Host "Restart IngeTrazo, then click the movable 360 Export logo button."

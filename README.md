@@ -29,6 +29,7 @@ D.S (Archviz360)
 - PNG and JPEG output
 - GPano metadata in JPEG panoramas
 - Automatic horizon leveling for straight, upright panoramas
+- Movable and floatable toolbar button using the Archviz360 logo
 - Cubemap horizontal strip and 4×3 cross layouts
 - Six-face cubemap ZIP export
 - Restores the original viewport after capturing the panorama
@@ -64,7 +65,8 @@ The installed structure must be:
 plugins/
 └── panorama_360/
     ├── __init__.py
-    └── panorama_core.py
+    ├── panorama_core.py
+    └── icon.png
 ```
 
 Restart IngeTrazo afterward.
@@ -72,7 +74,9 @@ Restart IngeTrazo afterward.
 ## Usage
 
 1. Open a model in IngeTrazo.
-2. Select **Extensions → Export 360 images…**.
+2. Click the **360 Export** logo button, or select
+   **Extensions → Export 360 images…**. Drag the button's toolbar handle to
+   dock it on any window edge or leave it floating.
 3. Choose **From view** to create a camera at the current viewpoint, or
    **Place…** to click a floor position in the model.
 4. Use **Aim…** to choose the center direction of the panorama.

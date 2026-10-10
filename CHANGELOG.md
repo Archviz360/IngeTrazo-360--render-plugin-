@@ -1,5 +1,12 @@
 # Changelog
 
+## 2.2.0
+
+- Added the supplied Archviz360 logo as the 360 Export button icon.
+- Added an independent toolbar that can be moved, floated, or docked on any
+  side of the IngeTrazo window.
+- The toolbar button opens and focuses the 360 Export panel.
+
 ## 2.1.0
 
 - Fixed corrupted degree signs, ellipses, multiplication signs, and dashes in
@@ -15,4 +22,3 @@
 - Cubemap cross, horizontal strip, and six-face ZIP output.
 - Persistent cameras with snapped placement, aiming, duplication, and batch export.
 - GPano metadata for JPEG panoramas.
-

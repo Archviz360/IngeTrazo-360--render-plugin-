@@ -18,12 +18,15 @@ import uuid
 import zipfile
 from pathlib import Path
 
-from PySide6.QtCore import QLineF, QPointF, QSettings, Qt, QUrl
-from PySide6.QtGui import QColor, QDesktopServices, QFont, QImage, QPainter, QPen, QVector3D
+from PySide6.QtCore import QLineF, QPointF, QSettings, QSize, Qt, QUrl
+from PySide6.QtGui import (
+    QAction, QColor, QDesktopServices, QFont, QIcon, QImage, QPainter, QPen,
+    QVector3D,
+)
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog,
     QFrame, QHBoxLayout, QLabel, QLineEdit, QListWidget,
-    QMessageBox, QProgressBar, QPushButton, QScrollArea,
+    QMessageBox, QProgressBar, QPushButton, QScrollArea, QToolBar,
     QVBoxLayout, QWidget,
 )
 
@@ -662,11 +665,65 @@ def draw_cameras(panel, viewport, painter):
             painter.drawText(QPointF(p[0] + 12, p[1] - 9), cam["name"])
 
 
+def _plugin_icon() -> QIcon:
+    """Load the supplied Archviz360 artwork in source and packaged layouts."""
+    here = Path(__file__).resolve()
+    for candidate in (here.with_name("icon.png"),
+                      here.with_name("panorama_360_icon.png")):
+        if candidate.is_file():
+            icon = QIcon(str(candidate))
+            if not icon.isNull():
+                return icon
+    return QIcon()
+
+
+def _install_toolbar(app, dock) -> None:
+    """Add an independently movable, dockable 360 Export logo button."""
+    window = getattr(app, "window", None)
+    if window is None or not hasattr(window, "addToolBar"):
+        return
+
+    object_name = "extension_panorama_360_toolbar"
+    if window.findChild(QToolBar, object_name) is not None:
+        return
+
+    toolbar = None
+    maker = getattr(window, "_new_toolbar", None)
+    if callable(maker):
+        try:
+            toolbar = maker(tr("360 Export"), object_name)
+        except Exception:
+            toolbar = None
+    if toolbar is None:
+        toolbar = QToolBar(tr("360 Export"), window)
+        toolbar.setObjectName(object_name)
+        toolbar.setMovable(True)
+        toolbar.setFloatable(True)
+        toolbar.setAllowedAreas(Qt.AllToolBarAreas)
+        reference = next((item for item in window.findChildren(QToolBar)
+                          if item is not toolbar), None)
+        toolbar.setIconSize(reference.iconSize() if reference else QSize(32, 32))
+        toolbar.setToolButtonStyle(Qt.ToolButtonIconOnly)
+        window.addToolBar(Qt.TopToolBarArea, toolbar)
+
+    action = QAction(_plugin_icon(), tr("360 Export"), window)
+    tip = tr("Open 360 Export cameras and panorama settings.")
+    action.setToolTip(tip)
+    action.setStatusTip(tip)
+    action.triggered.connect(lambda _checked=False: app.show_panel(dock))
+    toolbar.addAction(action)
+    toolbar._panorama_360_refs = (action, dock)
+
+
 def setup(app) -> None:
     panel = PanoramaPanel(app)
     dock = app.add_panel(tr("360 Export"), panel)
-    app.add_menu_action(tr("Export 360 images..."), lambda: app.show_panel(dock),
-                        tip=tr("Create panorama cameras and export immersive images."))
+    menu_action = app.add_menu_action(
+        tr("Export 360 images..."), lambda: app.show_panel(dock),
+        tip=tr("Create panorama cameras and export immersive images."))
+    if menu_action is not None:
+        menu_action.setIcon(_plugin_icon())
+    _install_toolbar(app, dock)
     app.on_document_changed(panel.refresh)
     app.add_overlay(lambda vp, painter: draw_cameras(panel, vp, painter))
     app.add_pickable(panel.pick_camera, on_select=panel.camera_picked,
