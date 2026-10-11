@@ -7,8 +7,7 @@
 # IngeTrazo Native 360 Export
 
 A native 360-degree panorama exporter for **IngeTrazo**. It uses
-IngeTrazo's existing 2D image renderer—no Blender or other external renderer
-is required.
+IngeTrazo's existing 2D image renderer
 
 The extension captures six 90-degree views around a persistent camera and
 stitches them into a standard 2:1 equirectangular image suitable for panorama
@@ -98,4 +97,8 @@ and combined into a seamless spherical projection.
 
 GNU General Public License v3.0 or later. See [LICENSE](LICENSE).
 
-## step guide
+## example
+
+<img width="2048" height="1024" alt="360-Camera-4" src="https://github.com/user-attachments/assets/dfa9c7d0-cfc2-453d-a3c3-1af809dde6d7" />
+
+
