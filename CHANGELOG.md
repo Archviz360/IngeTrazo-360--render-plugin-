@@ -1,5 +1,36 @@
 # Changelog
 
+## 3.1.0
+
+- Added a visual hotspot-placement workflow inside the interactive panorama.
+- Double-click empty space to create a navigation or information hotspot at
+  the calculated compass heading and vertical tilt.
+- Drag existing markers to reposition them and right-click to edit or delete.
+- Added optional horizon snapping, marker-size controls, navigation testing,
+  Previous/Next camera controls, and automatic return hotspots.
+- Numerical heading and tilt remain available for precise adjustment.
+
+## 3.0.1
+
+- Fixed black standalone HTML tours opened directly from disk. Panorama and
+  hotspot images are now embedded as data URLs, so WebGL no longer encounters
+  the browser's `file://` cross-origin texture restriction.
+- Added explicit panorama loading and WebGL error messages instead of leaving
+  an unexplained black viewport.
+
+## 3.0.0
+
+- Added navigation and information hotspot editing. Hotspots support target
+  cameras, labels, descriptions, images, links, compass headings, and tilt.
+- Added standalone offline HTML/WebGL tour export with camera navigation,
+  draggable viewing, zoom, compass bearings, and hotspot overlays.
+- Added Draft, Standard, High, and Ultra quality presets with supersampling,
+  smooth downsampling, cube-seam blending, sharpening, and tuned JPEG quality.
+- Added selective batch export with checkboxes, drag or button reordering,
+  progress percentage, estimated time, pause/resume, and cancellation.
+- Added a clickable visual compass with per-camera north, initial-view, and
+  panorama-seam controls. The selected seam is applied to exported panoramas.
+
 ## 2.4.0
 
 - Added an interactive 360-degree preview: drag to look around and use the

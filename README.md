@@ -28,6 +28,11 @@ D.S (Archviz360)
 - Inspect a draggable 360° panorama before committing to a full export
 - Browse saved cameras in a visual thumbnail gallery
 - Save projection, resolution, format, and output folder per camera
+- Build navigation and information hotspots between panorama cameras
+- Export a dependency-free standalone HTML/WebGL virtual tour
+- Choose Draft, Standard, High, or Ultra image-quality processing
+- Select and reorder batch cameras, then pause, resume, or cancel export
+- Visually set north, the initial tour direction, and the panorama seam
 - Export one camera or batch-export every camera
 - Equirectangular 360° output at 2K–16K
 - PNG and JPEG output
@@ -92,8 +97,44 @@ Restart IngeTrazo afterward.
 8. You can also press **Export selected 360…** to export without previewing.
 
 Use **Refresh camera thumbnails** after changing the model to update every
-image in the camera gallery. **Export all cameras…** uses each camera's own
-saved format, projection, resolution, and destination folder.
+image in the camera gallery. **Selective batch export…** uses each camera's
+own format, projection, resolution, quality, and destination folder.
+
+### Virtual tours
+
+Use **+ Navigation** to connect the selected camera to another camera. Use
+**+ Information** to add text, an image, and an optional web link. Set each
+hotspot's compass heading and vertical tilt, then choose **Export standalone
+HTML tour…**. Panorama and hotspot images are embedded in the generated
+`index.html`, so it opens directly from disk without a local server or an
+external JavaScript library.
+
+For easier placement, choose **Place hotspots visually…**:
+
+1. Drag the panorama to look around and use the wheel to zoom.
+2. Double-click the desired location and choose Navigation or Information.
+3. Drag a marker to reposition it; its heading and tilt are calculated live.
+4. Right-click a marker to edit or delete it.
+5. Enable **Test navigation** to follow arrows between cameras.
+
+Navigation arrows can snap to the horizon and optionally create a return
+hotspot in the destination camera. Previous/Next camera buttons let you edit
+the complete tour without closing the visual editor. Marker size and exact
+heading/tilt remain editable numerically.
+
+### Quality and batch control
+
+Choose **Draft**, **Standard**, **High**, or **Ultra** for each camera. High
+and Ultra render larger source faces and downsample them smoothly; the final
+panorama also receives seam blending and sharpening. **Selective batch
+export…** lets you check and reorder cameras. During processing, use
+**Pause**, **Resume**, or **Cancel** and monitor the estimated remaining time.
+
+### Compass and seam
+
+In **Compass and panorama seam**, select the marker edited by a compass click:
+North, Initial view, or Panorama seam. The blue, green, red, and black lines
+show north, initial view, seam, and camera heading respectively.
 
 Equirectangular exports are standard 2:1 images—for example, 4096×2048.
 The horizon is leveled automatically during export, even if the saved camera

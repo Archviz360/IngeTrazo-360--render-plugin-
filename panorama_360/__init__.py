@@ -10,24 +10,29 @@ stitched into a true equirectangular panorama; no external renderer is used.
 """
 from __future__ import annotations
 
+import base64
 import json
 import math
+import mimetypes
 import re
 import tempfile
+import time
 import uuid
 import zipfile
 from pathlib import Path
 
-from PySide6.QtCore import QLineF, QPointF, QSettings, QSize, Qt, QTimer, QUrl
+from PySide6.QtCore import (
+    QLineF, QPointF, QSettings, QSize, Qt, QTimer, QUrl, Signal,
+)
 from PySide6.QtGui import (
     QAction, QColor, QDesktopServices, QFont, QIcon, QImage, QPainter, QPen,
     QPixmap, QVector3D,
 )
 from PySide6.QtWidgets import (
-    QApplication, QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog,
-    QDialog, QDialogButtonBox, QFrame, QHBoxLayout, QLabel, QLineEdit,
-    QListWidget, QListWidgetItem, QMessageBox, QProgressBar, QPushButton,
-    QScrollArea, QToolBar, QVBoxLayout, QWidget,
+    QAbstractItemView, QApplication, QCheckBox, QComboBox, QDoubleSpinBox,
+    QFileDialog, QDialog, QDialogButtonBox, QFormLayout, QFrame, QHBoxLayout,
+    QLabel, QLineEdit, QListWidget, QListWidgetItem, QMessageBox, QProgressBar,
+    QPushButton, QScrollArea, QTextEdit, QToolBar, QVBoxLayout, QWidget, QMenu,
 )
 
 from . import panorama_core as pano
@@ -95,16 +100,30 @@ def _pick_tool(prompt, done, cancelled):
 class PanoramaView(QWidget):
     """Mouse-draggable perspective window into an equirectangular image."""
 
-    def __init__(self, image: QImage, parent=None) -> None:
+    placeRequested = Signal(str, float, float)
+    markerMoved = Signal(str, float, float)
+    markerEditRequested = Signal(str)
+    markerDeleteRequested = Signal(str)
+    navigateRequested = Signal(str)
+
+    def __init__(self, image: QImage, initial_yaw=0.0, centre_heading=0.0,
+                 north_heading=0.0, parent=None, hotspots=None) -> None:
         super().__init__(parent)
         source = image.scaled(4096, 2048, Qt.KeepAspectRatio,
                               Qt.SmoothTransformation)
         self._source = pano.prepare_equirectangular(source)
         self._frame = QImage()
-        self._yaw = 0.0
+        self._yaw = float(initial_yaw)
         self._pitch = 0.0
         self._fov = 75.0
+        self._centre_heading = float(centre_heading)
+        self._north_heading = float(north_heading)
         self._press = None
+        self._marker_drag = None
+        self._hotspots = hotspots if hotspots is not None else []
+        self._snap_navigation = True
+        self._test_navigation = False
+        self._cursor_readout = None
         self.setMinimumSize(640, 360)
         self.setCursor(Qt.OpenHandCursor)
         self.setFocusPolicy(Qt.StrongFocus)
@@ -131,11 +150,110 @@ class PanoramaView(QWidget):
         if not self._frame.isNull():
             painter.drawImage(self.rect(), self._frame)
         painter.setPen(Qt.white)
+        bearing = (self._centre_heading + self._yaw -
+                   self._north_heading) % 360.0
         painter.drawText(12, 24, tr(
-            "Heading {heading} deg | Tilt {tilt} deg | FOV {fov} deg",
-            heading=int(self._yaw % 360), tilt=int(self._pitch),
+            "Bearing {heading} deg | Tilt {tilt} deg | FOV {fov} deg",
+            heading=int(bearing), tilt=int(self._pitch),
             fov=int(self._fov)))
+        if self._cursor_readout is not None:
+            painter.drawText(12, 46, tr(
+                "Hotspot heading {heading:.1f} deg | Tilt {tilt:.1f} deg",
+                heading=self._cursor_readout[0],
+                tilt=self._cursor_readout[1]))
+        self._paint_hotspots(painter)
         painter.end()
+
+    def set_hotspots(self, hotspots) -> None:
+        self._hotspots = hotspots
+        self.update()
+
+    def set_snap_navigation(self, enabled) -> None:
+        self._snap_navigation = bool(enabled)
+
+    def set_test_navigation(self, enabled) -> None:
+        self._test_navigation = bool(enabled)
+        self.setCursor(Qt.PointingHandCursor if enabled else Qt.OpenHandCursor)
+
+    @staticmethod
+    def _signed_angle(value) -> float:
+        return ((float(value) + 180.0) % 360.0) - 180.0
+
+    def _project_hotspot(self, hotspot):
+        relative = math.radians(self._signed_angle(
+            hotspot["heading"] - self._centre_heading))
+        vertical = math.radians(hotspot["tilt"])
+        vector = (math.cos(vertical) * math.cos(relative),
+                  math.cos(vertical) * math.sin(relative),
+                  math.sin(vertical))
+        yaw, pitch = math.radians(self._yaw), math.radians(self._pitch)
+        cy, sy = math.cos(yaw), math.sin(yaw)
+        cp, sp = math.cos(pitch), math.sin(pitch)
+        front = (cp * cy, cp * sy, sp)
+        right = (-sy, cy, 0.0)
+        up = (-sp * cy, -sp * sy, cp)
+        dot = lambda a, b: sum(x * y for x, y in zip(a, b))
+        depth = dot(vector, front)
+        if depth <= 1e-6:
+            return None
+        tangent = math.tan(math.radians(self._fov) / 2.0)
+        aspect = self.width() / max(self.height(), 1)
+        nx = dot(vector, right) / (depth * tangent * aspect)
+        ny = dot(vector, up) / (depth * tangent)
+        if abs(nx) > 1.15 or abs(ny) > 1.15:
+            return None
+        return QPointF((nx * 0.5 + 0.5) * self.width(),
+                       (0.5 - ny * 0.5) * self.height())
+
+    def _screen_angles(self, position) -> tuple[float, float]:
+        width, height = max(self.width(), 1), max(self.height(), 1)
+        aspect = width / height
+        tangent = math.tan(math.radians(self._fov) / 2.0)
+        sx = ((position.x() / width) * 2.0 - 1.0) * aspect * tangent
+        sy = (1.0 - (position.y() / height) * 2.0) * tangent
+        yaw, pitch = math.radians(self._yaw), math.radians(self._pitch)
+        cy, syaw = math.cos(yaw), math.sin(yaw)
+        cp, sp = math.cos(pitch), math.sin(pitch)
+        front = (cp * cy, cp * syaw, sp)
+        right = (-syaw, cy, 0.0)
+        up = (-sp * cy, -sp * syaw, cp)
+        ray = tuple(front[i] + sx * right[i] + sy * up[i]
+                    for i in range(3))
+        length = math.sqrt(sum(value * value for value in ray))
+        ray = tuple(value / length for value in ray)
+        heading = (self._centre_heading +
+                   math.degrees(math.atan2(ray[1], ray[0]))) % 360.0
+        tilt = math.degrees(math.asin(max(-1.0, min(1.0, ray[2]))))
+        return heading, tilt
+
+    def _paint_hotspots(self, painter) -> None:
+        painter.setFont(QFont())
+        for hotspot in self._hotspots:
+            point = self._project_hotspot(hotspot)
+            if point is None:
+                continue
+            size = max(20, min(72, int(hotspot.get("size", 42))))
+            radius = size / 2.0
+            color = (QColor(35, 105, 210, 225) if hotspot["type"] == "info"
+                     else QColor(230, 55, 45, 225))
+            painter.setBrush(color)
+            painter.setPen(QPen(Qt.white, 2))
+            painter.drawEllipse(point, radius, radius)
+            painter.setPen(Qt.white)
+            symbol = "i" if hotspot["type"] == "info" else "->"
+            painter.drawText(QPointF(point.x() - 5, point.y() + 5), symbol)
+            painter.drawText(QPointF(point.x() + radius + 6,
+                                     point.y() + 5), hotspot["label"])
+
+    def _marker_at(self, position):
+        for hotspot in reversed(self._hotspots):
+            point = self._project_hotspot(hotspot)
+            if point is None:
+                continue
+            radius = max(14.0, int(hotspot.get("size", 42)) / 2.0)
+            if QLineF(point, position).length() <= radius:
+                return hotspot
+        return None
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
@@ -143,11 +261,49 @@ class PanoramaView(QWidget):
 
     def mousePressEvent(self, event) -> None:
         if event.button() == Qt.LeftButton:
+            hotspot = self._marker_at(event.position())
+            if hotspot is not None and self._test_navigation:
+                if hotspot["type"] == "navigation" and hotspot["target"]:
+                    self.navigateRequested.emit(hotspot["target"])
+                elif hotspot["type"] == "info":
+                    self.markerEditRequested.emit(hotspot["id"])
+                event.accept()
+                return
+            if hotspot is not None:
+                self._marker_drag = hotspot["id"]
+                self._cursor_readout = (hotspot["heading"], hotspot["tilt"])
+                self.setCursor(Qt.SizeAllCursor)
+                event.accept()
+                return
             self._press = event.position()
             self.setCursor(Qt.ClosedHandCursor)
             event.accept()
+        elif event.button() == Qt.RightButton:
+            hotspot = self._marker_at(event.position())
+            if hotspot is not None:
+                menu = QMenu(self)
+                edit = menu.addAction(tr("Edit hotspot..."))
+                delete = menu.addAction(tr("Delete hotspot"))
+                chosen = menu.exec(self.mapToGlobal(event.position().toPoint()))
+                if chosen is edit:
+                    self.markerEditRequested.emit(hotspot["id"])
+                elif chosen is delete:
+                    self.markerDeleteRequested.emit(hotspot["id"])
+                event.accept()
 
     def mouseMoveEvent(self, event) -> None:
+        if self._marker_drag is not None:
+            hotspot = next((item for item in self._hotspots
+                            if item["id"] == self._marker_drag), None)
+            if hotspot is not None:
+                heading, tilt = self._screen_angles(event.position())
+                if self._snap_navigation and hotspot["type"] == "navigation":
+                    tilt = 0.0
+                hotspot["heading"], hotspot["tilt"] = heading, tilt
+                self._cursor_readout = (heading, tilt)
+                self.update()
+            event.accept()
+            return
         if self._press is None:
             return
         pos = event.position()
@@ -161,9 +317,43 @@ class PanoramaView(QWidget):
 
     def mouseReleaseEvent(self, event) -> None:
         if event.button() == Qt.LeftButton:
+            if self._marker_drag is not None:
+                hotspot = next((item for item in self._hotspots
+                                if item["id"] == self._marker_drag), None)
+                self._marker_drag = None
+                self._cursor_readout = None
+                self.setCursor(Qt.PointingHandCursor if self._test_navigation
+                               else Qt.OpenHandCursor)
+                if hotspot is not None:
+                    self.markerMoved.emit(
+                        hotspot["id"], hotspot["heading"], hotspot["tilt"])
+                self.update()
+                event.accept()
+                return
             self._press = None
             self.setCursor(Qt.OpenHandCursor)
             event.accept()
+
+    def mouseDoubleClickEvent(self, event) -> None:
+        if event.button() != Qt.LeftButton or self._test_navigation:
+            return
+        self._press = None
+        self._marker_drag = None
+        self.setCursor(Qt.OpenHandCursor)
+        hotspot = self._marker_at(event.position())
+        if hotspot is not None:
+            self.markerEditRequested.emit(hotspot["id"])
+            return
+        heading, tilt = self._screen_angles(event.position())
+        menu = QMenu(self)
+        navigation = menu.addAction(tr("Place navigation hotspot"))
+        information = menu.addAction(tr("Place information hotspot"))
+        chosen = menu.exec(self.mapToGlobal(event.position().toPoint()))
+        if chosen is navigation:
+            self.placeRequested.emit("navigation", heading, 0.0 if
+                                     self._snap_navigation else tilt)
+        elif chosen is information:
+            self.placeRequested.emit("info", heading, tilt)
 
     def wheelEvent(self, event) -> None:
         steps = event.angleDelta().y() / 120.0
@@ -175,13 +365,17 @@ class PanoramaView(QWidget):
 class PanoramaPreviewDialog(QDialog):
     """Interactive approval dialog shown before a full-size export."""
 
-    def __init__(self, image: QImage, camera_name: str, parent=None) -> None:
+    def __init__(self, image: QImage, camera_name: str, export: dict,
+                 parent=None) -> None:
         super().__init__(parent)
         self.setWindowTitle(tr("Interactive 360 preview - {name}",
                                name=camera_name))
         self.resize(960, 620)
         layout = QVBoxLayout(self)
-        layout.addWidget(PanoramaView(image, self), 1)
+        centre = (export["seam_heading"] + 180.0) % 360.0
+        initial = ((export["start_heading"] - centre + 180.0) % 360.0) - 180.0
+        layout.addWidget(PanoramaView(
+            image, initial, centre, export["north_heading"], self), 1)
         help_label = QLabel(tr(
             "Drag to look around. Use the mouse wheel to zoom. This is a "
             "2K draft; the exported image uses the camera's saved settings."))
@@ -197,12 +391,345 @@ class PanoramaPreviewDialog(QDialog):
         layout.addWidget(buttons)
 
 
+class CompassWidget(QWidget):
+    """Clickable compass showing camera, north, start and seam headings."""
+
+    angleClicked = Signal(float)
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self._values = (0.0, 0.0, 0.0, 180.0)
+        self.setMinimumSize(170, 170)
+
+    def set_values(self, camera, north, start, seam) -> None:
+        self._values = (float(camera), float(north), float(start), float(seam))
+        self.update()
+
+    def paintEvent(self, _event) -> None:
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        centre = QPointF(self.width() / 2.0, self.height() / 2.0)
+        radius = max(20.0, min(self.width(), self.height()) / 2.0 - 20.0)
+        painter.setPen(QPen(QColor(120, 120, 120), 2))
+        painter.setBrush(Qt.NoBrush)
+        painter.drawEllipse(centre, radius, radius)
+        painter.drawText(QPointF(centre.x() - 5, centre.y() - radius - 4), "0")
+        painter.drawText(QPointF(centre.x() + radius + 5, centre.y() + 5), "90")
+        painter.drawText(QPointF(centre.x() - 10, centre.y() + radius + 15), "180")
+        painter.drawText(QPointF(centre.x() - radius - 24, centre.y() + 5), "270")
+        specs = ((self._values[0], QColor(40, 40, 40), 4),
+                 (self._values[1], QColor(35, 120, 235), 3),
+                 (self._values[2], QColor(35, 180, 95), 3),
+                 (self._values[3], QColor(235, 70, 55), 3))
+        for heading, color, width in specs:
+            angle = math.radians(heading)
+            tip = QPointF(centre.x() + math.sin(angle) * radius,
+                          centre.y() - math.cos(angle) * radius)
+            painter.setPen(QPen(color, width))
+            painter.drawLine(centre, tip)
+        painter.end()
+
+    def mousePressEvent(self, event) -> None:
+        if event.button() != Qt.LeftButton:
+            return
+        centre = QPointF(self.width() / 2.0, self.height() / 2.0)
+        delta = event.position() - centre
+        if delta.x() * delta.x() + delta.y() * delta.y() < 100.0:
+            return
+        self.angleClicked.emit(math.degrees(
+            math.atan2(delta.x(), -delta.y())) % 360.0)
+
+
+class HotspotDialog(QDialog):
+    """Editor for one navigation arrow or information hotspot."""
+
+    def __init__(self, kind, cameras, current_id, hotspot=None,
+                 default_heading=0.0, parent=None) -> None:
+        super().__init__(parent)
+        self._kind = kind
+        self.setWindowTitle(tr("Navigation hotspot") if kind == "navigation"
+                            else tr("Information hotspot"))
+        form = QFormLayout(self)
+        self._label = QLineEdit()
+        self._target = QComboBox()
+        for camera in cameras:
+            if camera["id"] != current_id:
+                self._target.addItem(camera["name"], camera["id"])
+        self._description = QTextEdit()
+        self._description.setMaximumHeight(100)
+        self._image = QLineEdit()
+        image_row = QHBoxLayout()
+        image_row.addWidget(self._image, 1)
+        browse = QPushButton(tr("Browse..."))
+        browse.clicked.connect(self._browse_image)
+        image_row.addWidget(browse)
+        self._url = QLineEdit()
+        self._heading = QDoubleSpinBox()
+        self._heading.setRange(0.0, 359.9)
+        self._heading.setWrapping(True)
+        self._heading.setSuffix(" deg")
+        self._tilt = QDoubleSpinBox()
+        self._tilt.setRange(-89.0, 89.0)
+        self._tilt.setSuffix(" deg")
+        self._size = QDoubleSpinBox()
+        self._size.setRange(20, 72)
+        self._size.setDecimals(0)
+        self._size.setSuffix(" px")
+        form.addRow(tr("Label:"), self._label)
+        if kind == "navigation":
+            form.addRow(tr("Target camera:"), self._target)
+        else:
+            form.addRow(tr("Description:"), self._description)
+            form.addRow(tr("Image:"), image_row)
+            form.addRow(tr("Web link:"), self._url)
+        form.addRow(tr("Compass heading:"), self._heading)
+        form.addRow(tr("Vertical tilt:"), self._tilt)
+        form.addRow(tr("Marker size:"), self._size)
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        form.addRow(buttons)
+        data = hotspot or {}
+        self._label.setText(str(data.get("label", "")))
+        self._description.setPlainText(str(data.get("description", "")))
+        self._image.setText(str(data.get("image", "")))
+        self._url.setText(str(data.get("url", "")))
+        self._heading.setValue(float(data.get("heading", default_heading)))
+        self._tilt.setValue(float(data.get("tilt", 0.0)))
+        self._size.setValue(float(data.get("size", 42)))
+        target = self._target.findData(data.get("target"))
+        if target >= 0:
+            self._target.setCurrentIndex(target)
+
+    def _browse_image(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self, tr("Choose hotspot image"), self._image.text(),
+            tr("Images (*.png *.jpg *.jpeg *.webp);;All files (*)"))
+        if path:
+            self._image.setText(path)
+
+    def hotspot(self, old_id=None) -> dict:
+        return pano.clean_hotspot({
+            "id": old_id or uuid.uuid4().hex,
+            "type": self._kind,
+            "label": self._label.text(),
+            "target": self._target.currentData() or "",
+            "description": self._description.toPlainText(),
+            "image": self._image.text(),
+            "url": self._url.text(),
+            "heading": self._heading.value(),
+            "tilt": self._tilt.value(),
+            "size": int(self._size.value()),
+        })
+
+
+class HotspotPlacementDialog(QDialog):
+    """Visual double-click/drag editor layered over a rendered panorama."""
+
+    def __init__(self, image, camera, cameras, export, parent=None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle(tr("Visual hotspot editor - {name}",
+                               name=camera["name"]))
+        self.resize(1080, 720)
+        self.camera = camera
+        self.cameras = cameras
+        self.action = None
+        self.backlinks = []
+        self._hotspots = [dict(item) for item in camera.get("hotspots", [])]
+        layout = QVBoxLayout(self)
+        help_label = QLabel(tr(
+            "Drag to look around. Double-click empty space to add a hotspot. "
+            "Drag markers to move them. Right-click a marker to edit or delete."))
+        help_label.setWordWrap(True)
+        layout.addWidget(help_label)
+        centre = (export["seam_heading"] + 180.0) % 360.0
+        initial = ((export["start_heading"] - centre + 180.0) % 360.0) - 180.0
+        self.viewer = PanoramaView(
+            image, initial, centre, export["north_heading"], self,
+            hotspots=self._hotspots)
+        self.viewer.placeRequested.connect(self._place)
+        self.viewer.markerMoved.connect(self._moved)
+        self.viewer.markerEditRequested.connect(self._edit)
+        self.viewer.markerDeleteRequested.connect(self._delete)
+        self.viewer.navigateRequested.connect(self._test_navigate)
+        layout.addWidget(self.viewer, 1)
+        options = QHBoxLayout()
+        self._snap = QCheckBox(tr("Snap navigation arrows to horizon"))
+        self._snap.setChecked(True)
+        self._snap.toggled.connect(self.viewer.set_snap_navigation)
+        self._return = QCheckBox(tr("Create return hotspot automatically"))
+        self._return.setChecked(True)
+        self._test = QCheckBox(tr("Test navigation"))
+        self._test.toggled.connect(self.viewer.set_test_navigation)
+        options.addWidget(self._snap)
+        options.addWidget(self._return)
+        options.addWidget(self._test)
+        options.addStretch(1)
+        layout.addLayout(options)
+        navigation = QHBoxLayout()
+        previous = QPushButton(tr("Previous camera"))
+        previous.clicked.connect(lambda: self._switch(-1))
+        next_camera = QPushButton(tr("Next camera"))
+        next_camera.clicked.connect(lambda: self._switch(1))
+        navigation.addWidget(previous)
+        navigation.addWidget(next_camera)
+        navigation.addStretch(1)
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.Save | QDialogButtonBox.Cancel)
+        buttons.button(QDialogButtonBox.Save).setText(tr("Save and close"))
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        navigation.addWidget(buttons)
+        layout.addLayout(navigation)
+
+    def _find(self, hotspot_id):
+        return next((item for item in self._hotspots
+                     if item["id"] == hotspot_id), None)
+
+    def _place(self, kind, heading, tilt) -> None:
+        if kind == "navigation" and len(self.cameras) < 2:
+            QMessageBox.information(
+                self, tr("Hotspots"),
+                tr("Create another camera before adding a navigation arrow."))
+            return
+        data = {"type": kind, "heading": heading, "tilt": tilt, "size": 42}
+        dialog = HotspotDialog(
+            kind, self.cameras, self.camera["id"], data, heading, self)
+        if dialog.exec() != QDialog.Accepted:
+            return
+        hotspot = dialog.hotspot()
+        if hotspot is None:
+            return
+        self._hotspots.append(hotspot)
+        if (kind == "navigation" and hotspot["target"] and
+                self._return.isChecked()):
+            self.backlinks.append({"hotspot": hotspot["id"],
+                                   "target": hotspot["target"]})
+        self.viewer.set_hotspots(self._hotspots)
+
+    def _edit(self, hotspot_id) -> None:
+        hotspot = self._find(hotspot_id)
+        if hotspot is None:
+            return
+        dialog = HotspotDialog(
+            hotspot["type"], self.cameras, self.camera["id"], hotspot,
+            hotspot["heading"], self)
+        if dialog.exec() != QDialog.Accepted:
+            return
+        replacement = dialog.hotspot(hotspot["id"])
+        if replacement is None:
+            return
+        index = self._hotspots.index(hotspot)
+        self._hotspots[index] = replacement
+        for backlink in self.backlinks:
+            if backlink["hotspot"] == hotspot_id:
+                backlink["target"] = replacement["target"]
+        self.viewer.set_hotspots(self._hotspots)
+
+    def _delete(self, hotspot_id) -> None:
+        hotspot = self._find(hotspot_id)
+        if hotspot is None:
+            return
+        self._hotspots.remove(hotspot)
+        self.backlinks = [item for item in self.backlinks
+                          if item["hotspot"] != hotspot_id]
+        self.viewer.set_hotspots(self._hotspots)
+
+    def _moved(self, hotspot_id, heading, tilt) -> None:
+        hotspot = self._find(hotspot_id)
+        if hotspot is not None:
+            hotspot["heading"], hotspot["tilt"] = heading, tilt
+
+    def _switch(self, delta) -> None:
+        self.action = ("switch", int(delta))
+        self.accept()
+
+    def _test_navigate(self, target_id) -> None:
+        self.action = ("target", target_id)
+        self.accept()
+
+    def hotspots(self):
+        return pano.clean_hotspots(self._hotspots)
+
+
+class BatchExportDialog(QDialog):
+    """Checked, reorderable list used to build the batch queue."""
+
+    def __init__(self, cameras, parent=None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle(tr("Selective batch export"))
+        self.resize(560, 430)
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel(tr(
+            "Check cameras to export. Drag items or use Up/Down to reorder.")))
+        self._list = QListWidget()
+        self._list.setDragDropMode(QAbstractItemView.InternalMove)
+        for camera in cameras:
+            export = pano.clean_export_settings(camera.get("export"),
+                                                camera["heading"])
+            item = QListWidgetItem(
+                f'{camera["name"]} | {export["width"]} px | '
+                f'{export["format"].upper()} | {export["quality"]}')
+            item.setData(Qt.UserRole, camera["id"])
+            item.setFlags(item.flags() | Qt.ItemIsUserCheckable |
+                          Qt.ItemIsDragEnabled | Qt.ItemIsDropEnabled)
+            item.setCheckState(Qt.Checked)
+            self._list.addItem(item)
+        layout.addWidget(self._list, 1)
+        row = QHBoxLayout()
+        select_all = QPushButton(tr("Select all"))
+        select_all.clicked.connect(lambda: self._check_all(True))
+        select_none = QPushButton(tr("Select none"))
+        select_none.clicked.connect(lambda: self._check_all(False))
+        up = QPushButton(tr("Up"))
+        up.clicked.connect(lambda: self._move(-1))
+        down = QPushButton(tr("Down"))
+        down.clicked.connect(lambda: self._move(1))
+        for button in (select_all, select_none, up, down):
+            row.addWidget(button)
+        layout.addLayout(row)
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.button(QDialogButtonBox.Ok).setText(tr("Export selected"))
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def _check_all(self, checked) -> None:
+        state = Qt.Checked if checked else Qt.Unchecked
+        for index in range(self._list.count()):
+            self._list.item(index).setCheckState(state)
+
+    def _move(self, delta) -> None:
+        row = self._list.currentRow()
+        target = row + delta
+        if row < 0 or target < 0 or target >= self._list.count():
+            return
+        item = self._list.takeItem(row)
+        self._list.insertItem(target, item)
+        self._list.setCurrentRow(target)
+
+    def selected_ids(self) -> list[str]:
+        return [self._list.item(i).data(Qt.UserRole)
+                for i in range(self._list.count())
+                if self._list.item(i).checkState() == Qt.Checked]
+
+
+class ExportCancelled(Exception):
+    pass
+
+
 class PanoramaPanel(QWidget):
     def __init__(self, app) -> None:
         super().__init__()
         self.app = app
         self._queue = []
         self._result = None
+        self._paused = False
+        self._cancel_requested = False
+        self._queue_started = 0.0
+        self._active_name = ""
         self._view_pick = None
         self._picking = None
         self._view_before_preview = None
@@ -228,6 +755,7 @@ class PanoramaPanel(QWidget):
 
         # Cameras live in the document and therefore follow copies and saves.
         sec = FoldSection(tr("360 cameras"), _SETTINGS + "open_cameras")
+        self._camera_panel = sec.body
         box = QVBoxLayout(sec.body)
         self._cameras = QListWidget()
         self._cameras.setMinimumHeight(150)
@@ -331,6 +859,43 @@ class PanoramaPanel(QWidget):
         box.addWidget(self._editor)
         lay.addWidget(sec)
 
+        sec = FoldSection(tr("Virtual tour hotspots"),
+                          _SETTINGS + "open_hotspots")
+        self._hotspot_panel = sec.body
+        box = QVBoxLayout(sec.body)
+        hotspot_help = QLabel(tr(
+            "Navigation arrows connect cameras. Information hotspots can "
+            "show text, an image, and a web link in the HTML tour."))
+        hotspot_help.setWordWrap(True)
+        hotspot_help.setStyleSheet("color: palette(mid);")
+        box.addWidget(hotspot_help)
+        self._hotspots = QListWidget()
+        self._hotspots.setMinimumHeight(90)
+        self._hotspots.itemDoubleClicked.connect(lambda _item: self._edit_hotspot())
+        box.addWidget(self._hotspots)
+        visual = QPushButton(tr("Place hotspots visually..."))
+        visual.setToolTip(tr(
+            "Open the panorama and place or drag hotspots directly on it"))
+        visual.clicked.connect(self._visual_hotspot_editor)
+        box.addWidget(visual)
+        row = QHBoxLayout()
+        add_navigation = QPushButton(tr("+ Navigation"))
+        add_navigation.clicked.connect(lambda: self._add_hotspot("navigation"))
+        add_info = QPushButton(tr("+ Information"))
+        add_info.clicked.connect(lambda: self._add_hotspot("info"))
+        row.addWidget(add_navigation)
+        row.addWidget(add_info)
+        box.addLayout(row)
+        row = QHBoxLayout()
+        edit_hotspot = QPushButton(tr("Edit"))
+        edit_hotspot.clicked.connect(self._edit_hotspot)
+        delete_hotspot = QPushButton(tr("Delete"))
+        delete_hotspot.clicked.connect(self._delete_hotspot)
+        row.addWidget(edit_hotspot)
+        row.addWidget(delete_hotspot)
+        box.addLayout(row)
+        lay.addWidget(sec)
+
         # Every camera keeps its own projection, image and destination settings.
         sec = FoldSection(tr("Projection and image"), _SETTINGS + "open_image")
         form = wrapping_form(sec.body)
@@ -365,6 +930,16 @@ class PanoramaPanel(QWidget):
         self._set_combo(self._format, settings.value(_SETTINGS + "format", "png"))
         self._format.currentIndexChanged.connect(self._export_settings_changed)
         form.addRow(tr("Format:"), self._format)
+        self._quality = QComboBox()
+        for label, key in ((tr("Draft - fast"), "draft"),
+                           (tr("Standard"), "standard"),
+                           (tr("High - supersampled"), "high"),
+                           (tr("Ultra - maximum quality"), "ultra")):
+            self._quality.addItem(label, key)
+        self._set_combo(self._quality, settings.value(
+            _SETTINGS + "quality", "standard"))
+        self._quality.currentIndexChanged.connect(self._export_settings_changed)
+        form.addRow(tr("Quality:"), self._quality)
         folder_row = QHBoxLayout()
         self._output_folder = QLineEdit()
         self._output_folder.setPlaceholderText(tr("Choose an output folder"))
@@ -389,9 +964,51 @@ class PanoramaPanel(QWidget):
         form.addRow(self._metadata)
         lay.addWidget(sec)
 
+        sec = FoldSection(tr("Compass and panorama seam"),
+                          _SETTINGS + "open_compass")
+        form = wrapping_form(sec.body)
+        compass_help = QLabel(tr(
+            "Click the compass to set the marker selected below. Blue is "
+            "north, green is the initial tour view, red is the image seam, "
+            "and black is the camera heading."))
+        compass_help.setWordWrap(True)
+        compass_help.setStyleSheet("color: palette(mid);")
+        form.addRow(compass_help)
+        self._compass = CompassWidget()
+        self._compass.angleClicked.connect(self._compass_clicked)
+        form.addRow(self._compass)
+        self._compass_target = QComboBox()
+        self._compass_target.addItem(tr("North direction"), "north")
+        self._compass_target.addItem(tr("Starting direction"), "start")
+        self._compass_target.addItem(tr("Panorama seam"), "seam")
+        form.addRow(tr("Click sets:"), self._compass_target)
+        self._north = self._heading_spin()
+        self._start_heading = self._heading_spin()
+        self._seam_heading = self._heading_spin()
+        for spin in (self._north, self._start_heading, self._seam_heading):
+            spin.valueChanged.connect(self._export_settings_changed)
+        form.addRow(tr("North:"), self._north)
+        form.addRow(tr("Initial view:"), self._start_heading)
+        form.addRow(tr("Image seam:"), self._seam_heading)
+        row = QHBoxLayout()
+        north_camera = QPushButton(tr("North = camera"))
+        north_camera.clicked.connect(
+            lambda: self._north.setValue(self._heading.value()))
+        start_camera = QPushButton(tr("Start = camera"))
+        start_camera.clicked.connect(
+            lambda: self._start_heading.setValue(self._heading.value()))
+        seam_behind = QPushButton(tr("Seam behind"))
+        seam_behind.clicked.connect(lambda: self._seam_heading.setValue(
+            (self._heading.value() + 180.0) % 360.0))
+        for button in (north_camera, start_camera, seam_behind):
+            row.addWidget(button)
+        form.addRow(row)
+        lay.addWidget(sec)
+
         self._export_settings = (
-            self._projection, self._resolution, self._format,
+            self._projection, self._resolution, self._format, self._quality,
             self._output_folder, self._folder_button, self._metadata,
+            self._north, self._start_heading, self._seam_heading,
         )
 
         sec = FoldSection(tr("Export"), _SETTINGS + "open_export")
@@ -411,11 +1028,24 @@ class PanoramaPanel(QWidget):
         self._interactive.clicked.connect(self._interactive_preview)
         self._go = QPushButton(tr("Export selected 360..."))
         self._go.clicked.connect(self._export_selected)
-        self._all = QPushButton(tr("Export all cameras..."))
+        self._all = QPushButton(tr("Selective batch export..."))
         self._all.clicked.connect(self._export_all)
+        self._tour = QPushButton(tr("Export standalone HTML tour..."))
+        self._tour.clicked.connect(self._export_tour)
         box.addWidget(self._interactive)
         box.addWidget(self._go)
         box.addWidget(self._all)
+        box.addWidget(self._tour)
+        run_row = QHBoxLayout()
+        self._pause = QPushButton(tr("Pause"))
+        self._pause.clicked.connect(self._toggle_pause)
+        self._cancel = QPushButton(tr("Cancel"))
+        self._cancel.clicked.connect(self._cancel_export)
+        self._pause.setVisible(False)
+        self._cancel.setVisible(False)
+        run_row.addWidget(self._pause)
+        run_row.addWidget(self._cancel)
+        box.addLayout(run_row)
         self._bar = QProgressBar()
         self._bar.setRange(0, 1000)
         self._bar.setVisible(False)
@@ -429,7 +1059,7 @@ class PanoramaPanel(QWidget):
         lay.addStretch(1)
         narrow(self._name, self._projection, self._resolution, self._format,
                self._output_folder, self._interactive, self._go, self._all,
-               self._status)
+               self._tour, self._status)
         self._projection_changed()
         self._update_renderer_label()
 
@@ -437,6 +1067,15 @@ class PanoramaPanel(QWidget):
     def _set_combo(combo, data) -> None:
         i = combo.findData(data)
         combo.setCurrentIndex(max(0, i))
+
+    @staticmethod
+    def _heading_spin() -> QDoubleSpinBox:
+        spin = QDoubleSpinBox()
+        spin.setRange(0.0, 359.9)
+        spin.setDecimals(1)
+        spin.setWrapping(True)
+        spin.setSuffix(" deg")
+        return spin
 
     # ---- Cameras ----------------------------------------------------------
     def cameras(self):
@@ -477,10 +1116,12 @@ class PanoramaPanel(QWidget):
 
     @staticmethod
     def _camera_item_text(camera) -> str:
-        export = pano.clean_export_settings(camera.get("export"))
+        export = pano.clean_export_settings(camera.get("export"),
+                                            camera["heading"])
         projection = export["projection"].replace("_", " ")
         return (f'{camera["name"]}\n{export["width"]} px | '
-                f'{export["format"].upper()} | {projection}')
+                f'{export["format"].upper()} | {export["quality"]} | '
+                f'{projection}')
 
     def _capture_missing_thumbnails(self) -> None:
         if self._thumbnail_busy:
@@ -521,7 +1162,7 @@ class PanoramaPanel(QWidget):
         self._editor.setEnabled(on)
         if on:
             cam = cams[row]
-            export = pano.clean_export_settings(cam.get("export"))
+            export = pano.clean_export_settings(cam.get("export"), cam["heading"])
             controls = [self._name, *self._xyz, self._heading, self._tilt]
             for w in controls:
                 w.blockSignals(True)
@@ -533,22 +1174,31 @@ class PanoramaPanel(QWidget):
             for w in controls:
                 w.blockSignals(False)
             self._loading_camera = True
-            for widget in (self._projection, self._resolution, self._format,
-                           self._output_folder):
+            export_widgets = (self._projection, self._resolution, self._format,
+                              self._quality, self._output_folder, self._north,
+                              self._start_heading, self._seam_heading)
+            for widget in export_widgets:
                 widget.blockSignals(True)
             self._set_combo(self._projection, export["projection"])
             self._set_combo(self._resolution, export["width"])
             self._set_combo(self._format, export["format"])
+            self._set_combo(self._quality, export["quality"])
             self._output_folder.setText(export["folder"])
-            for widget in (self._projection, self._resolution, self._format,
-                           self._output_folder):
+            self._north.setValue(export["north_heading"])
+            self._start_heading.setValue(export["start_heading"])
+            self._seam_heading.setValue(export["seam_heading"])
+            for widget in export_widgets:
                 widget.blockSignals(False)
             self._loading_camera = False
             self._update_size_label()
+            self._update_compass()
+            self._refresh_hotspots(cam)
             if self._view_before_preview is not None:
                 self._apply_preview(cam)
         elif self._view_before_preview is not None:
             self._stop_preview()
+        if not on:
+            self._hotspots.clear()
         self.app.viewport.update()
 
     def _view_values(self):
@@ -558,13 +1208,20 @@ class PanoramaPanel(QWidget):
         tilt = math.degrees(math.asin(max(-1.0, min(1.0, d.z()))))
         return [eye.x(), eye.y(), eye.z()], heading, tilt
 
-    def _new_camera(self, pos, heading, tilt, name=None, export=None):
+    def _new_camera(self, pos, heading, tilt, name=None, export=None,
+                    hotspots=None):
         cams = self.cameras()
+        settings = pano.clean_export_settings(
+            export if export is not None else self._current_export_settings(),
+            heading)
+        if export is None:
+            settings["start_heading"] = heading % 360.0
+            settings["seam_heading"] = (heading + 180.0) % 360.0
         cams.append({"id": uuid.uuid4().hex, "name": name or tr(
             "360 Camera {n}", n=len(cams) + 1), "pos": list(pos),
             "heading": heading, "tilt": tilt,
-            "export": pano.clean_export_settings(
-                export if export is not None else self._current_export_settings())})
+            "export": settings,
+            "hotspots": pano.clean_hotspots(hotspots or [])})
         _store(self.app, cams)
         self._cameras.setCurrentRow(len(cams) - 1)
 
@@ -587,7 +1244,8 @@ class PanoramaPanel(QWidget):
         pos = list(cam["pos"])
         pos[0] += 0.25
         self._new_camera(pos, cam["heading"], cam["tilt"],
-                         cam["name"] + " " + tr("copy"), cam.get("export"))
+                         cam["name"] + " " + tr("copy"), cam.get("export"),
+                         cam.get("hotspots"))
 
     def _delete(self):
         i = self.selected_index()
@@ -596,8 +1254,14 @@ class PanoramaPanel(QWidget):
         if self._view_before_preview is not None:
             self._stop_preview()
         cams = self.cameras()
-        self._thumbnails.pop(cams[i]["id"], None)
+        removed_id = cams[i]["id"]
+        self._thumbnails.pop(removed_id, None)
         del cams[i]
+        for camera in cams:
+            camera["hotspots"] = [
+                spot for spot in camera.get("hotspots", [])
+                if not (spot["type"] == "navigation" and
+                        spot["target"] == removed_id)]
         _store(self.app, cams)
 
     def _edited(self):
@@ -640,6 +1304,184 @@ class PanoramaPanel(QWidget):
         self._preview_status.setText(tr("Camera preview is off."))
         self.app.viewport.update()
         self.app.viewport.setFocus()
+
+    # ---- Virtual-tour hotspots ------------------------------------------
+    def _refresh_hotspots(self, camera=None) -> None:
+        camera = camera or self.selected_camera()
+        self._hotspots.clear()
+        if camera is None:
+            return
+        names = {item["id"]: item["name"] for item in self.cameras()}
+        for hotspot in camera.get("hotspots", []):
+            if hotspot["type"] == "navigation":
+                target = names.get(hotspot["target"], tr("Missing camera"))
+                text = f'-> {target} | {hotspot["label"]}'
+            else:
+                text = f'i | {hotspot["label"]}'
+            item = QListWidgetItem(text)
+            item.setData(Qt.UserRole, hotspot["id"])
+            self._hotspots.addItem(item)
+
+    def _add_hotspot(self, kind) -> None:
+        camera = self.selected_camera()
+        if camera is None:
+            QMessageBox.information(
+                self, tr("Hotspots"), tr("Create or select a camera first."))
+            return
+        if kind == "navigation" and len(self.cameras()) < 2:
+            QMessageBox.information(
+                self, tr("Hotspots"),
+                tr("Create another camera before adding a navigation arrow."))
+            return
+        export = pano.clean_export_settings(camera.get("export"),
+                                            camera["heading"])
+        dialog = HotspotDialog(kind, self.cameras(), camera["id"],
+                               default_heading=export["start_heading"],
+                               parent=self)
+        if dialog.exec() != QDialog.Accepted:
+            return
+        hotspot = dialog.hotspot()
+        if hotspot is None:
+            return
+        cams, index = self.cameras(), self.selected_index()
+        cams[index].setdefault("hotspots", []).append(hotspot)
+        _store(self.app, cams)
+
+    def _edit_hotspot(self) -> None:
+        camera = self.selected_camera()
+        row = self._hotspots.currentRow()
+        if camera is None or not (0 <= row < len(camera.get("hotspots", []))):
+            return
+        hotspot = camera["hotspots"][row]
+        dialog = HotspotDialog(
+            hotspot["type"], self.cameras(), camera["id"], hotspot,
+            hotspot["heading"], self)
+        if dialog.exec() != QDialog.Accepted:
+            return
+        edited = dialog.hotspot(hotspot["id"])
+        if edited is None:
+            return
+        cams, index = self.cameras(), self.selected_index()
+        cams[index]["hotspots"][row] = edited
+        _store(self.app, cams)
+
+    def _delete_hotspot(self) -> None:
+        camera = self.selected_camera()
+        row = self._hotspots.currentRow()
+        if camera is None or not (0 <= row < len(camera.get("hotspots", []))):
+            return
+        cams, index = self.cameras(), self.selected_index()
+        del cams[index]["hotspots"][row]
+        _store(self.app, cams)
+
+    def _visual_hotspot_editor(self) -> None:
+        selected = self.selected_camera()
+        if selected is None:
+            QMessageBox.information(
+                self, tr("Hotspots"), tr("Create or select a camera first."))
+            return
+        camera_id = selected["id"]
+        cache = {}
+        while True:
+            cameras = self.cameras()
+            index = next((i for i, item in enumerate(cameras)
+                          if item["id"] == camera_id), None)
+            if index is None:
+                return
+            camera = cameras[index]
+            if camera_id not in cache:
+                image = self._render_hotspot_panorama(camera)
+                if image is None:
+                    return
+                cache[camera_id] = image
+            export = pano.clean_export_settings(camera.get("export"),
+                                                camera["heading"])
+            dialog = HotspotPlacementDialog(
+                cache[camera_id], camera, cameras, export, self)
+            if dialog.exec() != QDialog.Accepted:
+                return
+            cameras = self.cameras()
+            index = next((i for i, item in enumerate(cameras)
+                          if item["id"] == camera_id), None)
+            if index is None:
+                return
+            cameras[index]["hotspots"] = dialog.hotspots()
+            self._apply_return_hotspots(cameras, camera_id, dialog.backlinks)
+            _store(self.app, cameras)
+            action = dialog.action
+            if action is None:
+                return
+            current = next((i for i, item in enumerate(cameras)
+                            if item["id"] == camera_id), 0)
+            if action[0] == "switch":
+                camera_id = cameras[(current + action[1]) % len(cameras)]["id"]
+            elif action[0] == "target":
+                if not any(item["id"] == action[1] for item in cameras):
+                    return
+                camera_id = action[1]
+            row = next((i for i, item in enumerate(cameras)
+                        if item["id"] == camera_id), 0)
+            self._cameras.setCurrentRow(row)
+
+    def _render_hotspot_panorama(self, camera):
+        export = pano.clean_export_settings(camera.get("export"),
+                                            camera["heading"])
+        preset = pano.QUALITY_PRESETS[export["quality"]]
+        self._cancel_requested = False
+        self._paused = False
+        self._queue_started = time.monotonic()
+        self._active_name = camera["name"]
+        self._set_running(True)
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            faces = pano.render_cube_faces(
+                self.app.viewport, camera, 512, overlays=False,
+                auto_level=True,
+                progress=lambda value: self._queue_progress(value * 0.35))
+            image = pano.cube_to_equirectangular(
+                faces, 2048, seam_blend=preset["seam"],
+                progress=lambda value: self._queue_progress(
+                    0.35 + value * 0.65))
+            return pano.rotate_equirectangular(
+                image, camera["heading"], export["seam_heading"])
+        except ExportCancelled:
+            self._status.setText(tr("Hotspot panorama cancelled."))
+            return None
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.critical(self, tr("Hotspot editor"), str(exc))
+            self._status.setText(tr("Could not render the hotspot panorama."))
+            return None
+        finally:
+            QApplication.restoreOverrideCursor()
+            self._set_running(False)
+
+    @staticmethod
+    def _apply_return_hotspots(cameras, source_id, requests) -> None:
+        source = next((item for item in cameras if item["id"] == source_id), None)
+        if source is None:
+            return
+        source_pos = QVector3D(*source["pos"])
+        for request in requests:
+            target = next((item for item in cameras
+                           if item["id"] == request["target"]), None)
+            if target is None:
+                continue
+            if any(spot["type"] == "navigation" and
+                   spot["target"] == source_id
+                   for spot in target.get("hotspots", [])):
+                continue
+            delta = source_pos - QVector3D(*target["pos"])
+            heading = (math.degrees(math.atan2(delta.x(), delta.y())) % 360.0
+                       if delta.lengthSquared() > 1e-12 else 0.0)
+            target.setdefault("hotspots", []).append(pano.clean_hotspot({
+                "id": uuid.uuid4().hex,
+                "type": "navigation",
+                "label": tr("Back to {name}", name=source["name"]),
+                "target": source_id,
+                "heading": heading,
+                "tilt": 0.0,
+                "size": 42,
+            }))
 
     def _begin_pick(self, purpose):
         if purpose != "new" and self.selected_camera() is None:
@@ -693,7 +1535,23 @@ class PanoramaPanel(QWidget):
             "width": self._resolution.currentData(),
             "format": self._format.currentData(),
             "folder": self._output_folder.text(),
-        })
+            "quality": self._quality.currentData(),
+            "north_heading": self._north.value(),
+            "start_heading": self._start_heading.value(),
+            "seam_heading": self._seam_heading.value(),
+        }, self._heading.value())
+
+    def _update_compass(self) -> None:
+        self._compass.set_values(
+            self._heading.value(), self._north.value(),
+            self._start_heading.value(), self._seam_heading.value())
+
+    def _compass_clicked(self, heading) -> None:
+        target = self._compass_target.currentData()
+        spin = {"north": self._north, "start": self._start_heading,
+                "seam": self._seam_heading}.get(target)
+        if spin is not None:
+            spin.setValue(heading)
 
     def _export_settings_changed(self, *_args) -> None:
         self._update_size_label()
@@ -704,6 +1562,7 @@ class PanoramaPanel(QWidget):
         if i is None or i >= len(cams):
             return
         cams[i]["export"] = self._current_export_settings()
+        self._update_compass()
         self._remember()
         _store(self.app, cams)
 
@@ -731,6 +1590,7 @@ class PanoramaPanel(QWidget):
             "projection": self._projection.currentData(),
             "width": self._resolution.currentData(),
             "format": self._format.currentData(),
+            "quality": self._quality.currentData(),
             "folder": self._output_folder.text().strip(),
             "metadata": int(self._metadata.isChecked()),
             "eye_height": self._eye_height.value(),
@@ -745,7 +1605,8 @@ class PanoramaPanel(QWidget):
     # ---- Export -----------------------------------------------------------
     @staticmethod
     def _destination_suffix(camera):
-        export = pano.clean_export_settings(camera.get("export"))
+        export = pano.clean_export_settings(camera.get("export"),
+                                            camera["heading"])
         if export["projection"] == "cubemap_faces":
             return ".zip"
         return pano.FORMATS[export["format"]]["suffix"]
@@ -756,8 +1617,15 @@ class PanoramaPanel(QWidget):
             QMessageBox.information(
                 self, tr("360 preview"), tr("Create or select a camera first."))
             return
+        export = pano.clean_export_settings(camera.get("export"),
+                                            camera["heading"])
+        preset = pano.QUALITY_PRESETS[export["quality"]]
         self._remember()
         self._result = None
+        self._cancel_requested = False
+        self._paused = False
+        self._queue_started = time.monotonic()
+        self._active_name = camera["name"]
         self._set_running(True)
         self._status.setText(tr(
             "Rendering interactive preview for {name}...",
@@ -766,12 +1634,17 @@ class PanoramaPanel(QWidget):
         try:
             faces = pano.render_cube_faces(
                 self.app.viewport, camera, 512, overlays=False,
-                auto_level=True)
-            self._bar.setValue(350)
+                auto_level=True,
+                progress=lambda value: self._queue_progress(value * 0.35))
             image = pano.cube_to_equirectangular(
-                faces, 2048,
-                progress=lambda value: self._bar.setValue(
-                    int((0.35 + value * 0.65) * 1000)))
+                faces, 2048, seam_blend=preset["seam"],
+                progress=lambda value: self._queue_progress(
+                    0.35 + value * 0.65))
+            image = pano.rotate_equirectangular(
+                image, camera["heading"], export["seam_heading"])
+        except ExportCancelled:
+            self._status.setText(tr("360 preview cancelled."))
+            return
         except Exception as exc:  # noqa: BLE001
             QMessageBox.critical(self, tr("360 preview"), str(exc))
             self._status.setText(tr("360 preview failed."))
@@ -780,7 +1653,7 @@ class PanoramaPanel(QWidget):
             QApplication.restoreOverrideCursor()
             self._set_running(False)
         self._status.setText(tr("Interactive preview is ready."))
-        dialog = PanoramaPreviewDialog(image, camera["name"], self)
+        dialog = PanoramaPreviewDialog(image, camera["name"], export, self)
         if dialog.exec() == QDialog.Accepted:
             self._export_selected()
 
@@ -789,7 +1662,7 @@ class PanoramaPanel(QWidget):
         if cam is None:
             QMessageBox.information(self, tr("360 export"), tr("Create or select a camera first."))
             return
-        export = pano.clean_export_settings(cam.get("export"))
+        export = pano.clean_export_settings(cam.get("export"), cam["heading"])
         suffix = self._destination_suffix(cam)
         doc = getattr(self.app.window, "_current_path", None)
         base = (Path(export["folder"]) if export["folder"] else
@@ -816,8 +1689,17 @@ class PanoramaPanel(QWidget):
         if not cams:
             QMessageBox.information(self, tr("360 export"), tr("Create a camera first."))
             return
+        dialog = BatchExportDialog(cams, self)
+        if dialog.exec() != QDialog.Accepted:
+            return
+        by_id = {camera["id"]: camera for camera in cams}
+        cams = [by_id[key] for key in dialog.selected_ids() if key in by_id]
+        if not cams:
+            QMessageBox.information(
+                self, tr("Batch export"), tr("Select at least one camera."))
+            return
         missing_folder = any(not pano.clean_export_settings(
-            cam.get("export"))["folder"] for cam in cams)
+            cam.get("export"), cam["heading"])["folder"] for cam in cams)
         fallback = ""
         if missing_folder:
             document = getattr(self.app.window, "_current_path", None)
@@ -829,7 +1711,8 @@ class PanoramaPanel(QWidget):
         used = set()
         jobs = []
         for cam in cams:
-            export = pano.clean_export_settings(cam.get("export"))
+            export = pano.clean_export_settings(cam.get("export"),
+                                                cam["heading"])
             folder = Path(export["folder"] or fallback)
             suffix = self._destination_suffix(cam)
             stem, n = _safe_name(cam["name"]), 2
@@ -842,44 +1725,164 @@ class PanoramaPanel(QWidget):
             jobs.append((cam, folder / (unique + suffix)))
         self._start_queue(jobs)
 
+    def _export_tour(self) -> None:
+        cameras = self.cameras()
+        if not cameras:
+            QMessageBox.information(
+                self, tr("HTML tour"), tr("Create a camera first."))
+            return
+        root = QFileDialog.getExistingDirectory(
+            self, tr("Choose the standalone tour folder"), str(Path.home()))
+        if not root:
+            return
+        root = Path(root)
+        panorama_folder = root / "panoramas"
+        jobs = []
+        rendered = []
+        for camera in cameras:
+            clone = json.loads(json.dumps(camera))
+            export = pano.clean_export_settings(clone.get("export"),
+                                                clone["heading"])
+            export.update(projection="equirectangular", format="jpeg",
+                          folder=str(panorama_folder))
+            clone["export"] = export
+            destination = panorama_folder / (clone["id"] + ".jpg")
+            jobs.append((clone, destination))
+            rendered.append(clone)
+        if not self._start_queue(jobs):
+            return
+        try:
+            index = self._write_tour_files(root, rendered)
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.critical(self, tr("HTML tour"), str(exc))
+            self._status.setText(tr("HTML tour creation failed."))
+            return
+        self._result = index
+        self._status.setText(tr("HTML tour complete.") +
+                             ' <a href="#open">' + tr("Open result") + "</a>")
+
+    @staticmethod
+    def _write_tour_files(root: Path, rendered) -> Path:
+        tour_data = []
+        valid_ids = {camera["id"] for camera in rendered}
+        for camera in rendered:
+            export = pano.clean_export_settings(camera.get("export"),
+                                                camera["heading"])
+            hotspots = []
+            for hotspot in camera.get("hotspots", []):
+                item = dict(hotspot)
+                if item["type"] == "navigation" and item["target"] not in valid_ids:
+                    continue
+                source = Path(item.get("image", ""))
+                if item["type"] == "info" and source.is_file():
+                    item["image"] = PanoramaPanel._file_data_url(source)
+                elif item["type"] == "info":
+                    item["image"] = ""
+                hotspots.append(item)
+            panorama = root / "panoramas" / (camera["id"] + ".jpg")
+            tour_data.append({
+                "id": camera["id"], "name": camera["name"],
+                "image": PanoramaPanel._file_data_url(panorama),
+                "north_heading": export["north_heading"],
+                "start_heading": export["start_heading"],
+                "seam_heading": export["seam_heading"],
+                "hotspots": hotspots,
+            })
+        index = root / "index.html"
+        index.write_text(pano.tour_html(tour_data), encoding="utf-8")
+        return index
+
+    @staticmethod
+    def _file_data_url(path: Path) -> str:
+        mime = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+        encoded = base64.b64encode(path.read_bytes()).decode("ascii")
+        return f"data:{mime};base64,{encoded}"
+
     def _start_queue(self, jobs):
         self._remember()
         self._queue = list(jobs)
         self._result = None
+        self._paused = False
+        self._cancel_requested = False
+        self._queue_started = time.monotonic()
         self._set_running(True)
         QApplication.setOverrideCursor(Qt.WaitCursor)
+        success = False
         try:
             total = len(self._queue)
             for index, (camera, destination) in enumerate(self._queue, 1):
-                self._status.setText(tr(
-                    "Rendering {name} with IngeTrazo...", name=camera["name"]))
-                QApplication.processEvents()
+                self._active_name = camera["name"]
+                self._queue_progress((index - 1) / max(total, 1))
                 self._native_export(camera, Path(destination), index, total)
                 self._result = Path(destination)
+            success = True
+        except ExportCancelled:
+            self._status.setText(tr("Export cancelled."))
         except Exception as exc:  # noqa: BLE001
             QMessageBox.critical(self, tr("360 export"), str(exc))
             self._status.setText(tr("360 export failed."))
-            return
         finally:
             self._queue.clear()
             QApplication.restoreOverrideCursor()
             self._set_running(False)
+        if not success:
+            return False
         self._status.setText(tr("Export complete.") + ' <a href="#open">' +
                              tr("Open result") + "</a>")
+        return True
+
+    def _toggle_pause(self) -> None:
+        self._paused = not self._paused
+        self._pause.setText(tr("Resume") if self._paused else tr("Pause"))
+
+    def _cancel_export(self) -> None:
+        self._cancel_requested = True
+        self._paused = False
+
+    def _check_queue_controls(self) -> None:
+        QApplication.processEvents()
+        while self._paused and not self._cancel_requested:
+            self._status.setText(tr("Export paused."))
+            QApplication.processEvents()
+            time.sleep(0.05)
+        if self._cancel_requested:
+            raise ExportCancelled()
+
+    def _queue_progress(self, value) -> None:
+        self._check_queue_controls()
+        value = max(0.0, min(1.0, float(value)))
+        self._bar.setValue(int(value * 1000))
+        elapsed = max(0.0, time.monotonic() - self._queue_started)
+        eta = int(elapsed * (1.0 - value) / value) if value > 0.01 else 0
+        eta_text = tr(" | about {seconds} s remaining", seconds=eta) if eta else ""
+        self._status.setText(tr(
+            "Rendering {name}: {percent}%{eta}", name=self._active_name,
+            percent=int(value * 100), eta=eta_text))
 
     def _native_export(self, camera, destination: Path,
                        job_index: int, job_total: int) -> None:
         """Capture six native 2D views and assemble one true 360 image."""
-        export = pano.clean_export_settings(camera.get("export"))
+        export = pano.clean_export_settings(camera.get("export"),
+                                            camera["heading"])
         projection = export["projection"]
         width = export["width"]
-        face_size = (width if projection in pano.CUBE_PROJECTIONS
-                     else max(256, width // 4))
+        preset = pano.QUALITY_PRESETS[export["quality"]]
+        face_size = (width if projection in pano.CUBE_PROJECTIONS else
+                     max(256, width // 4))
+        render_size = max(64, min(8192, int(round(
+            face_size * preset["scale"]))))
         base = (job_index - 1) / max(job_total, 1)
         span = 1.0 / max(job_total, 1)
-        faces = pano.render_cube_faces(self.app.viewport, camera, face_size,
-                                       overlays=False, auto_level=True)
-        self._bar.setValue(int((base + span * 0.35) * 1000))
+        faces = pano.render_cube_faces(
+            self.app.viewport, camera, render_size, overlays=False,
+            auto_level=True,
+            progress=lambda value: self._queue_progress(
+                base + span * value * 0.4))
+        if render_size != face_size:
+            faces = {name: image.scaled(
+                face_size, face_size, Qt.IgnoreAspectRatio,
+                Qt.SmoothTransformation) for name, image in faces.items()}
+        self._queue_progress(base + span * 0.42)
         destination.parent.mkdir(parents=True, exist_ok=True)
         fmt = export["format"]
         meta = pano.manifest(camera, projection, width, fmt)
@@ -889,15 +1892,21 @@ class PanoramaPanel(QWidget):
             paths = {}
             for name, image in faces.items():
                 path = folder / (name + suffix)
-                if not image.save(str(path), None, 95):
+                if not image.save(str(path), None, preset["jpeg"]):
                     raise RuntimeError(tr("Could not save cube face {name}.",
                                           name=name))
                 paths[name] = path
+                self._check_queue_controls()
             if projection == "equirectangular":
                 image = pano.cube_to_equirectangular(
-                    faces, width, progress=lambda value: self._bar.setValue(
-                        int((base + span * (0.35 + value * 0.65)) * 1000)))
-                if not image.save(str(destination), None, 95):
+                    faces, width, seam_blend=preset["seam"],
+                    progress=lambda value: self._queue_progress(
+                        base + span * (0.45 + value * 0.45)))
+                image = pano.rotate_equirectangular(
+                    image, camera["heading"], export["seam_heading"])
+                image = pano.sharpen_image(image, preset["sharpen"])
+                self._queue_progress(base + span * 0.94)
+                if not image.save(str(destination), None, preset["jpeg"]):
                     raise RuntimeError(tr("Could not save the 360 image."))
                 if fmt == "jpeg":
                     pano.add_gpano_xmp(destination, width, width // 2)
@@ -913,7 +1922,7 @@ class PanoramaPanel(QWidget):
         if self._metadata.isChecked() and projection != "cubemap_faces":
             destination.with_suffix(destination.suffix + ".json").write_text(
                 json.dumps(meta, indent=2), encoding="utf-8")
-        self._bar.setValue(int((base + span) * 1000))
+        self._queue_progress(base + span)
 
     @staticmethod
     def _compose_cube(faces, destination, projection, size):
@@ -942,9 +1951,15 @@ class PanoramaPanel(QWidget):
         self._interactive.setVisible(not running)
         self._go.setVisible(not running)
         self._all.setVisible(not running)
+        self._tour.setVisible(not running)
+        self._pause.setVisible(running)
+        self._cancel.setVisible(running)
+        self._camera_panel.setEnabled(not running)
+        self._hotspot_panel.setEnabled(not running)
         for widget in self._export_settings:
             widget.setEnabled(not running)
         if not running:
+            self._pause.setText(tr("Pause"))
             self._projection_changed()
 
     def _open_result(self, _link=None):
@@ -974,8 +1989,14 @@ class PanoramaPanel(QWidget):
         if 0 <= index < len(cams):
             if self._view_before_preview is not None:
                 self._stop_preview()
-            self._thumbnails.pop(cams[index]["id"], None)
+            removed_id = cams[index]["id"]
+            self._thumbnails.pop(removed_id, None)
             del cams[index]
+            for camera in cams:
+                camera["hotspots"] = [
+                    spot for spot in camera.get("hotspots", [])
+                    if not (spot["type"] == "navigation" and
+                            spot["target"] == removed_id)]
             _store(self.app, cams)
 
 
