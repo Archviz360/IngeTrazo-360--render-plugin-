@@ -1,5 +1,15 @@
 # Changelog
 
+## 2.4.0
+
+- Added an interactive 360-degree preview: drag to look around and use the
+  mouse wheel to zoom before exporting the full-size image.
+- Added a camera thumbnail gallery with automatic captures and a manual
+  refresh command.
+- Added projection, resolution, format, and output-folder settings saved
+  separately with every camera.
+- Batch export now respects each camera's individual settings and destination.
+
 ## 2.3.0
 
 - Added a live 90-degree preview from the selected 360 camera.

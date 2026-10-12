@@ -25,6 +25,9 @@ D.S (Archviz360)
 - Move, aim, rename, duplicate, and delete cameras
 - Preview the selected camera through its 90° capture lens
 - Return from camera preview to the exact previous perspective view
+- Inspect a draggable 360° panorama before committing to a full export
+- Browse saved cameras in a visual thumbnail gallery
+- Save projection, resolution, format, and output folder per camera
 - Export one camera or batch-export every camera
 - Equirectangular 360° output at 2K–16K
 - PNG and JPEG output
@@ -83,8 +86,14 @@ Restart IngeTrazo afterward.
 4. Use **Aim…** to choose the center direction of the panorama.
 5. Press **View camera preview** to inspect the selected camera. Press
    **Back to normal view** to restore your previous viewport perspective.
-6. Select an equirectangular or cubemap projection and resolution.
-7. Press **Export selected 360…**.
+6. Choose that camera's projection, resolution, format, and output folder.
+7. Press **Interactive 360 preview…**, then drag to look around and use the
+   mouse wheel to zoom. Choose **Export full image…** when satisfied.
+8. You can also press **Export selected 360…** to export without previewing.
+
+Use **Refresh camera thumbnails** after changing the model to update every
+image in the camera gallery. **Export all cameras…** uses each camera's own
+saved format, projection, resolution, and destination folder.
 
 Equirectangular exports are standard 2:1 images—for example, 4096×2048.
 The horizon is leveled automatically during export, even if the saved camera

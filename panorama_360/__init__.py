@@ -18,16 +18,16 @@ import uuid
 import zipfile
 from pathlib import Path
 
-from PySide6.QtCore import QLineF, QPointF, QSettings, QSize, Qt, QUrl
+from PySide6.QtCore import QLineF, QPointF, QSettings, QSize, Qt, QTimer, QUrl
 from PySide6.QtGui import (
     QAction, QColor, QDesktopServices, QFont, QIcon, QImage, QPainter, QPen,
-    QVector3D,
+    QPixmap, QVector3D,
 )
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog,
-    QFrame, QHBoxLayout, QLabel, QLineEdit, QListWidget,
-    QMessageBox, QProgressBar, QPushButton, QScrollArea, QToolBar,
-    QVBoxLayout, QWidget,
+    QDialog, QDialogButtonBox, QFrame, QHBoxLayout, QLabel, QLineEdit,
+    QListWidget, QListWidgetItem, QMessageBox, QProgressBar, QPushButton,
+    QScrollArea, QToolBar, QVBoxLayout, QWidget,
 )
 
 from . import panorama_core as pano
@@ -92,6 +92,111 @@ def _pick_tool(prompt, done, cancelled):
     return _Pick()
 
 
+class PanoramaView(QWidget):
+    """Mouse-draggable perspective window into an equirectangular image."""
+
+    def __init__(self, image: QImage, parent=None) -> None:
+        super().__init__(parent)
+        source = image.scaled(4096, 2048, Qt.KeepAspectRatio,
+                              Qt.SmoothTransformation)
+        self._source = pano.prepare_equirectangular(source)
+        self._frame = QImage()
+        self._yaw = 0.0
+        self._pitch = 0.0
+        self._fov = 75.0
+        self._press = None
+        self.setMinimumSize(640, 360)
+        self.setCursor(Qt.OpenHandCursor)
+        self.setFocusPolicy(Qt.StrongFocus)
+        self._timer = QTimer(self)
+        self._timer.setSingleShot(True)
+        self._timer.timeout.connect(self._render)
+        self._schedule()
+
+    def _schedule(self) -> None:
+        if not self._timer.isActive():
+            self._timer.start(0)
+
+    def _render(self) -> None:
+        if self.width() < 2 or self.height() < 2:
+            return
+        self._frame = pano.equirectangular_view(
+            self._source, self.width(), self.height(), self._yaw,
+            self._pitch, self._fov)
+        self.update()
+
+    def paintEvent(self, _event) -> None:
+        painter = QPainter(self)
+        painter.fillRect(self.rect(), QColor(12, 12, 12))
+        if not self._frame.isNull():
+            painter.drawImage(self.rect(), self._frame)
+        painter.setPen(Qt.white)
+        painter.drawText(12, 24, tr(
+            "Heading {heading} deg | Tilt {tilt} deg | FOV {fov} deg",
+            heading=int(self._yaw % 360), tilt=int(self._pitch),
+            fov=int(self._fov)))
+        painter.end()
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self._schedule()
+
+    def mousePressEvent(self, event) -> None:
+        if event.button() == Qt.LeftButton:
+            self._press = event.position()
+            self.setCursor(Qt.ClosedHandCursor)
+            event.accept()
+
+    def mouseMoveEvent(self, event) -> None:
+        if self._press is None:
+            return
+        pos = event.position()
+        delta = pos - self._press
+        self._press = pos
+        self._yaw = (self._yaw - delta.x() * 0.18) % 360.0
+        self._pitch = max(-89.0, min(89.0,
+                                    self._pitch + delta.y() * 0.18))
+        self._schedule()
+        event.accept()
+
+    def mouseReleaseEvent(self, event) -> None:
+        if event.button() == Qt.LeftButton:
+            self._press = None
+            self.setCursor(Qt.OpenHandCursor)
+            event.accept()
+
+    def wheelEvent(self, event) -> None:
+        steps = event.angleDelta().y() / 120.0
+        self._fov = max(25.0, min(110.0, self._fov - steps * 5.0))
+        self._schedule()
+        event.accept()
+
+
+class PanoramaPreviewDialog(QDialog):
+    """Interactive approval dialog shown before a full-size export."""
+
+    def __init__(self, image: QImage, camera_name: str, parent=None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle(tr("Interactive 360 preview - {name}",
+                               name=camera_name))
+        self.resize(960, 620)
+        layout = QVBoxLayout(self)
+        layout.addWidget(PanoramaView(image, self), 1)
+        help_label = QLabel(tr(
+            "Drag to look around. Use the mouse wheel to zoom. This is a "
+            "2K draft; the exported image uses the camera's saved settings."))
+        help_label.setWordWrap(True)
+        layout.addWidget(help_label)
+        buttons = QDialogButtonBox(self)
+        export = buttons.addButton(tr("Export full image..."),
+                                   QDialogButtonBox.AcceptRole)
+        buttons.addButton(tr("Close preview"), QDialogButtonBox.RejectRole)
+        export.setDefault(True)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+
 class PanoramaPanel(QWidget):
     def __init__(self, app) -> None:
         super().__init__()
@@ -101,6 +206,9 @@ class PanoramaPanel(QWidget):
         self._view_pick = None
         self._picking = None
         self._view_before_preview = None
+        self._thumbnails = {}
+        self._thumbnail_busy = False
+        self._loading_camera = False
         self._build_ui()
         self.refresh()
 
@@ -122,7 +230,9 @@ class PanoramaPanel(QWidget):
         sec = FoldSection(tr("360 cameras"), _SETTINGS + "open_cameras")
         box = QVBoxLayout(sec.body)
         self._cameras = QListWidget()
-        self._cameras.setMinimumHeight(82)
+        self._cameras.setMinimumHeight(150)
+        self._cameras.setIconSize(QSize(112, 63))
+        self._cameras.setSpacing(3)
         self._cameras.currentRowChanged.connect(self._selected)
         box.addWidget(self._cameras)
         row = QHBoxLayout()
@@ -135,6 +245,11 @@ class PanoramaPanel(QWidget):
         row.addWidget(add)
         row.addWidget(place)
         box.addLayout(row)
+        thumbnails = QPushButton(tr("Refresh camera thumbnails"))
+        thumbnails.setToolTip(tr(
+            "Capture a new gallery thumbnail for every saved camera"))
+        thumbnails.clicked.connect(self.refresh_thumbnails)
+        box.addWidget(thumbnails)
 
         self._editor = QWidget()
         form = wrapping_form(self._editor)
@@ -216,15 +331,20 @@ class PanoramaPanel(QWidget):
         box.addWidget(self._editor)
         lay.addWidget(sec)
 
-        # Projection and image settings are user preferences, not model data.
+        # Every camera keeps its own projection, image and destination settings.
         sec = FoldSection(tr("Projection and image"), _SETTINGS + "open_image")
         form = wrapping_form(sec.body)
+        per_camera = QLabel(tr("These settings are saved with the selected camera."))
+        per_camera.setWordWrap(True)
+        per_camera.setStyleSheet("color: palette(mid);")
+        form.addRow(per_camera)
         self._projection = QComboBox()
         for key, label in _PROJECTION_LABELS:
             self._projection.addItem(tr(label), key)
         self._set_combo(self._projection, settings.value(
             _SETTINGS + "projection", "equirectangular"))
-        self._projection.currentIndexChanged.connect(self._projection_changed)
+        self._projection.currentIndexChanged.connect(
+            self._export_settings_changed)
         form.addRow(tr("Projection:"), self._projection)
         self._resolution = QComboBox()
         for label, px in (("2K", 2048), ("4K", 4096), ("6K", 6144),
@@ -232,7 +352,8 @@ class PanoramaPanel(QWidget):
             self._resolution.addItem(label, px)
         wanted = int(settings.value(_SETTINGS + "width", 4096))
         self._resolution.setCurrentIndex(max(0, self._resolution.findData(wanted)))
-        self._resolution.currentIndexChanged.connect(self._update_size_label)
+        self._resolution.currentIndexChanged.connect(
+            self._export_settings_changed)
         self._size = QLabel()
         rrow = QHBoxLayout()
         rrow.addWidget(self._resolution, 1)
@@ -242,7 +363,20 @@ class PanoramaPanel(QWidget):
         for label, key in (("PNG", "png"), ("JPEG", "jpeg")):
             self._format.addItem(label, key)
         self._set_combo(self._format, settings.value(_SETTINGS + "format", "png"))
+        self._format.currentIndexChanged.connect(self._export_settings_changed)
         form.addRow(tr("Format:"), self._format)
+        folder_row = QHBoxLayout()
+        self._output_folder = QLineEdit()
+        self._output_folder.setPlaceholderText(tr("Choose an output folder"))
+        self._output_folder.setText(str(settings.value(
+            _SETTINGS + "folder", "")))
+        self._output_folder.editingFinished.connect(
+            self._export_settings_changed)
+        self._folder_button = QPushButton(tr("Browse..."))
+        self._folder_button.clicked.connect(self._choose_output_folder)
+        folder_row.addWidget(self._output_folder, 1)
+        folder_row.addWidget(self._folder_button)
+        form.addRow(tr("Output folder:"), folder_row)
         self._auto_level = QCheckBox(tr("Auto-level horizon (always on)"))
         self._auto_level.setChecked(True)
         self._auto_level.setEnabled(False)
@@ -256,7 +390,8 @@ class PanoramaPanel(QWidget):
         lay.addWidget(sec)
 
         self._export_settings = (
-            self._projection, self._resolution, self._format, self._metadata,
+            self._projection, self._resolution, self._format,
+            self._output_folder, self._folder_button, self._metadata,
         )
 
         sec = FoldSection(tr("Export"), _SETTINGS + "open_export")
@@ -270,10 +405,15 @@ class PanoramaPanel(QWidget):
         self._where = QLabel()
         self._where.setWordWrap(True)
         box.addWidget(self._where)
+        self._interactive = QPushButton(tr("Interactive 360 preview..."))
+        self._interactive.setToolTip(tr(
+            "Render a draggable 2K panorama preview before exporting"))
+        self._interactive.clicked.connect(self._interactive_preview)
         self._go = QPushButton(tr("Export selected 360..."))
         self._go.clicked.connect(self._export_selected)
         self._all = QPushButton(tr("Export all cameras..."))
         self._all.clicked.connect(self._export_all)
+        box.addWidget(self._interactive)
         box.addWidget(self._go)
         box.addWidget(self._all)
         self._bar = QProgressBar()
@@ -288,7 +428,8 @@ class PanoramaPanel(QWidget):
         lay.addWidget(sec)
         lay.addStretch(1)
         narrow(self._name, self._projection, self._resolution, self._format,
-               self._go, self._all, self._status)
+               self._output_folder, self._interactive, self._go, self._all,
+               self._status)
         self._projection_changed()
         self._update_renderer_label()
 
@@ -314,10 +455,17 @@ class PanoramaPanel(QWidget):
         chosen = self.selected_camera()
         chosen_id = chosen["id"] if chosen else None
         cams = self.cameras()
+        valid_ids = {cam["id"] for cam in cams}
+        self._thumbnails = {key: value for key, value in self._thumbnails.items()
+                            if key in valid_ids}
         self._cameras.blockSignals(True)
         self._cameras.clear()
         for cam in cams:
-            self._cameras.addItem(cam["name"])
+            item = QListWidgetItem(self._camera_item_text(cam))
+            thumbnail = self._thumbnails.get(cam["id"])
+            if thumbnail is not None and not thumbnail.isNull():
+                item.setIcon(QIcon(QPixmap.fromImage(thumbnail)))
+            self._cameras.addItem(item)
         row = next((i for i, c in enumerate(cams) if c["id"] == chosen_id), 0)
         self._cameras.setCurrentRow(row if cams else -1)
         self._cameras.blockSignals(False)
@@ -325,6 +473,47 @@ class PanoramaPanel(QWidget):
         self._view_pick = None
         self.app.release_pick()
         self.app.viewport.update()
+        QTimer.singleShot(0, self._capture_missing_thumbnails)
+
+    @staticmethod
+    def _camera_item_text(camera) -> str:
+        export = pano.clean_export_settings(camera.get("export"))
+        projection = export["projection"].replace("_", " ")
+        return (f'{camera["name"]}\n{export["width"]} px | '
+                f'{export["format"].upper()} | {projection}')
+
+    def _capture_missing_thumbnails(self) -> None:
+        if self._thumbnail_busy:
+            return
+        missing = [(i, cam) for i, cam in enumerate(self.cameras())
+                   if cam["id"] not in self._thumbnails]
+        if not missing:
+            return
+        self._thumbnail_busy = True
+        try:
+            for index, cam in missing:
+                try:
+                    image = pano.render_camera_image(
+                        self.app.viewport, cam, 224, 126, fov=90.0)
+                except Exception:
+                    continue
+                self._thumbnails[cam["id"]] = image
+                item = self._cameras.item(index)
+                if item is not None:
+                    item.setIcon(QIcon(QPixmap.fromImage(image)))
+                QApplication.processEvents()
+        finally:
+            self._thumbnail_busy = False
+
+    def refresh_thumbnails(self) -> None:
+        self._thumbnails.clear()
+        for index in range(self._cameras.count()):
+            self._cameras.item(index).setIcon(QIcon())
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            self._capture_missing_thumbnails()
+        finally:
+            QApplication.restoreOverrideCursor()
 
     def _selected(self, row) -> None:
         cams = self.cameras()
@@ -332,6 +521,7 @@ class PanoramaPanel(QWidget):
         self._editor.setEnabled(on)
         if on:
             cam = cams[row]
+            export = pano.clean_export_settings(cam.get("export"))
             controls = [self._name, *self._xyz, self._heading, self._tilt]
             for w in controls:
                 w.blockSignals(True)
@@ -342,6 +532,19 @@ class PanoramaPanel(QWidget):
             self._tilt.setValue(cam["tilt"])
             for w in controls:
                 w.blockSignals(False)
+            self._loading_camera = True
+            for widget in (self._projection, self._resolution, self._format,
+                           self._output_folder):
+                widget.blockSignals(True)
+            self._set_combo(self._projection, export["projection"])
+            self._set_combo(self._resolution, export["width"])
+            self._set_combo(self._format, export["format"])
+            self._output_folder.setText(export["folder"])
+            for widget in (self._projection, self._resolution, self._format,
+                           self._output_folder):
+                widget.blockSignals(False)
+            self._loading_camera = False
+            self._update_size_label()
             if self._view_before_preview is not None:
                 self._apply_preview(cam)
         elif self._view_before_preview is not None:
@@ -355,11 +558,13 @@ class PanoramaPanel(QWidget):
         tilt = math.degrees(math.asin(max(-1.0, min(1.0, d.z()))))
         return [eye.x(), eye.y(), eye.z()], heading, tilt
 
-    def _new_camera(self, pos, heading, tilt, name=None):
+    def _new_camera(self, pos, heading, tilt, name=None, export=None):
         cams = self.cameras()
         cams.append({"id": uuid.uuid4().hex, "name": name or tr(
             "360 Camera {n}", n=len(cams) + 1), "pos": list(pos),
-            "heading": heading, "tilt": tilt})
+            "heading": heading, "tilt": tilt,
+            "export": pano.clean_export_settings(
+                export if export is not None else self._current_export_settings())})
         _store(self.app, cams)
         self._cameras.setCurrentRow(len(cams) - 1)
 
@@ -371,6 +576,7 @@ class PanoramaPanel(QWidget):
         if i is None:
             return
         cams = self.cameras()
+        self._thumbnails.pop(cams[i]["id"], None)
         cams[i]["pos"], cams[i]["heading"], cams[i]["tilt"] = self._view_values()
         _store(self.app, cams)
 
@@ -381,7 +587,7 @@ class PanoramaPanel(QWidget):
         pos = list(cam["pos"])
         pos[0] += 0.25
         self._new_camera(pos, cam["heading"], cam["tilt"],
-                         cam["name"] + " " + tr("copy"))
+                         cam["name"] + " " + tr("copy"), cam.get("export"))
 
     def _delete(self):
         i = self.selected_index()
@@ -390,6 +596,7 @@ class PanoramaPanel(QWidget):
         if self._view_before_preview is not None:
             self._stop_preview()
         cams = self.cameras()
+        self._thumbnails.pop(cams[i]["id"], None)
         del cams[i]
         _store(self.app, cams)
 
@@ -399,6 +606,7 @@ class PanoramaPanel(QWidget):
         if i is None or i >= len(cams):
             return
         cam = cams[i]
+        self._thumbnails.pop(cam["id"], None)
         cam.update(name=self._name.text().strip() or cam["name"],
                    pos=[s.value() for s in self._xyz],
                    heading=self._heading.value(), tilt=self._tilt.value())
@@ -455,6 +663,7 @@ class PanoramaPanel(QWidget):
             i, cams = self.selected_index(), self.cameras()
             if i is not None:
                 cam = cams[i]
+                self._thumbnails.pop(cam["id"], None)
                 if purpose == "move":
                     cam["pos"] = [point.x(), point.y(),
                                   point.z() + self._eye_height.value()]
@@ -478,6 +687,37 @@ class PanoramaPanel(QWidget):
     def _projection_changed(self):
         self._update_size_label()
 
+    def _current_export_settings(self) -> dict:
+        return pano.clean_export_settings({
+            "projection": self._projection.currentData(),
+            "width": self._resolution.currentData(),
+            "format": self._format.currentData(),
+            "folder": self._output_folder.text(),
+        })
+
+    def _export_settings_changed(self, *_args) -> None:
+        self._update_size_label()
+        if self._loading_camera:
+            return
+        i = self.selected_index()
+        cams = self.cameras()
+        if i is None or i >= len(cams):
+            return
+        cams[i]["export"] = self._current_export_settings()
+        self._remember()
+        _store(self.app, cams)
+
+    def _choose_output_folder(self) -> None:
+        current = self._output_folder.text().strip()
+        if not current:
+            document = getattr(self.app.window, "_current_path", None)
+            current = str(Path(document).parent if document else Path.home())
+        folder = QFileDialog.getExistingDirectory(
+            self, tr("Choose this camera's output folder"), current)
+        if folder:
+            self._output_folder.setText(folder)
+            self._export_settings_changed()
+
     def _update_size_label(self):
         key = self._projection.currentData()
         width = int(self._resolution.currentData() or 4096)
@@ -491,6 +731,7 @@ class PanoramaPanel(QWidget):
             "projection": self._projection.currentData(),
             "width": self._resolution.currentData(),
             "format": self._format.currentData(),
+            "folder": self._output_folder.text().strip(),
             "metadata": int(self._metadata.isChecked()),
             "eye_height": self._eye_height.value(),
         }
@@ -498,22 +739,61 @@ class PanoramaPanel(QWidget):
             s.setValue(_SETTINGS + key, value)
 
     def _update_renderer_label(self):
-        self._where.setText(tr("Native 360 export is ready."))
+        self._where.setText(tr(
+            "Native 360 export is ready. Each camera keeps its own settings."))
 
     # ---- Export -----------------------------------------------------------
-    def _destination_suffix(self):
-        if self._projection.currentData() == "cubemap_faces":
+    @staticmethod
+    def _destination_suffix(camera):
+        export = pano.clean_export_settings(camera.get("export"))
+        if export["projection"] == "cubemap_faces":
             return ".zip"
-        return pano.FORMATS[self._format.currentData()]["suffix"]
+        return pano.FORMATS[export["format"]]["suffix"]
+
+    def _interactive_preview(self):
+        camera = self.selected_camera()
+        if camera is None:
+            QMessageBox.information(
+                self, tr("360 preview"), tr("Create or select a camera first."))
+            return
+        self._remember()
+        self._result = None
+        self._set_running(True)
+        self._status.setText(tr(
+            "Rendering interactive preview for {name}...",
+            name=camera["name"]))
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            faces = pano.render_cube_faces(
+                self.app.viewport, camera, 512, overlays=False,
+                auto_level=True)
+            self._bar.setValue(350)
+            image = pano.cube_to_equirectangular(
+                faces, 2048,
+                progress=lambda value: self._bar.setValue(
+                    int((0.35 + value * 0.65) * 1000)))
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.critical(self, tr("360 preview"), str(exc))
+            self._status.setText(tr("360 preview failed."))
+            return
+        finally:
+            QApplication.restoreOverrideCursor()
+            self._set_running(False)
+        self._status.setText(tr("Interactive preview is ready."))
+        dialog = PanoramaPreviewDialog(image, camera["name"], self)
+        if dialog.exec() == QDialog.Accepted:
+            self._export_selected()
 
     def _export_selected(self):
         cam = self.selected_camera()
         if cam is None:
             QMessageBox.information(self, tr("360 export"), tr("Create or select a camera first."))
             return
-        suffix = self._destination_suffix()
+        export = pano.clean_export_settings(cam.get("export"))
+        suffix = self._destination_suffix(cam)
         doc = getattr(self.app.window, "_current_path", None)
-        base = Path(doc).parent if doc else Path.home()
+        base = (Path(export["folder"]) if export["folder"] else
+                (Path(doc).parent if doc else Path.home()))
         start = base / (_safe_name(cam["name"]) + suffix)
         path, _ = QFileDialog.getSaveFileName(
             self, tr("Export 360 image"), str(start),
@@ -522,6 +802,13 @@ class PanoramaPanel(QWidget):
             path = Path(path)
             if not path.suffix:
                 path = path.with_suffix(suffix)
+            export["folder"] = str(path.parent)
+            cam["export"] = export
+            cams = self.cameras()
+            i = self.selected_index()
+            if i is not None and i < len(cams):
+                cams[i]["export"] = export
+                _store(self.app, cams)
             self._start_queue([(cam, path)])
 
     def _export_all(self):
@@ -529,19 +816,30 @@ class PanoramaPanel(QWidget):
         if not cams:
             QMessageBox.information(self, tr("360 export"), tr("Create a camera first."))
             return
-        folder = QFileDialog.getExistingDirectory(self, tr("Export all 360 cameras"))
-        if not folder:
-            return
-        suffix = self._destination_suffix()
+        missing_folder = any(not pano.clean_export_settings(
+            cam.get("export"))["folder"] for cam in cams)
+        fallback = ""
+        if missing_folder:
+            document = getattr(self.app.window, "_current_path", None)
+            start = str(Path(document).parent if document else Path.home())
+            fallback = QFileDialog.getExistingDirectory(
+                self, tr("Choose a folder for cameras without one"), start)
+            if not fallback:
+                return
         used = set()
         jobs = []
         for cam in cams:
+            export = pano.clean_export_settings(cam.get("export"))
+            folder = Path(export["folder"] or fallback)
+            suffix = self._destination_suffix(cam)
             stem, n = _safe_name(cam["name"]), 2
             unique = stem
-            while unique.casefold() in used:
+            key = (str(folder).casefold(), unique.casefold())
+            while key in used:
                 unique, n = f"{stem}-{n}", n + 1
-            used.add(unique.casefold())
-            jobs.append((cam, Path(folder) / (unique + suffix)))
+                key = (str(folder).casefold(), unique.casefold())
+            used.add(key)
+            jobs.append((cam, folder / (unique + suffix)))
         self._start_queue(jobs)
 
     def _start_queue(self, jobs):
@@ -572,8 +870,9 @@ class PanoramaPanel(QWidget):
     def _native_export(self, camera, destination: Path,
                        job_index: int, job_total: int) -> None:
         """Capture six native 2D views and assemble one true 360 image."""
-        projection = self._projection.currentData()
-        width = int(self._resolution.currentData())
+        export = pano.clean_export_settings(camera.get("export"))
+        projection = export["projection"]
+        width = export["width"]
         face_size = (width if projection in pano.CUBE_PROJECTIONS
                      else max(256, width // 4))
         base = (job_index - 1) / max(job_total, 1)
@@ -582,7 +881,7 @@ class PanoramaPanel(QWidget):
                                        overlays=False, auto_level=True)
         self._bar.setValue(int((base + span * 0.35) * 1000))
         destination.parent.mkdir(parents=True, exist_ok=True)
-        fmt = self._format.currentData()
+        fmt = export["format"]
         meta = pano.manifest(camera, projection, width, fmt)
         with tempfile.TemporaryDirectory(prefix="ingetrazo-360-") as folder:
             folder = Path(folder)
@@ -640,6 +939,7 @@ class PanoramaPanel(QWidget):
 
     def _set_running(self, running):
         self._bar.setVisible(running)
+        self._interactive.setVisible(not running)
         self._go.setVisible(not running)
         self._all.setVisible(not running)
         for widget in self._export_settings:
@@ -672,6 +972,9 @@ class PanoramaPanel(QWidget):
     def delete_camera_at(self, index):
         cams = self.cameras()
         if 0 <= index < len(cams):
+            if self._view_before_preview is not None:
+                self._stop_preview()
+            self._thumbnails.pop(cams[index]["id"], None)
             del cams[index]
             _store(self.app, cams)
 

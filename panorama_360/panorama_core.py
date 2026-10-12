@@ -21,6 +21,12 @@ FORMATS = {
     "png": {"suffix": ".png", "depths": (8,)},
     "jpeg": {"suffix": ".jpg", "depths": (8,)},
 }
+DEFAULT_EXPORT = {
+    "projection": "equirectangular",
+    "width": 4096,
+    "format": "png",
+    "folder": "",
+}
 CUBE_PROJECTIONS = frozenset(("cubemap_faces", "cubemap_strip",
                               "cubemap_cross"))
 _VIEW_FIELDS = ("distance", "yaw", "pitch", "fov_deg", "aspect", "znear",
@@ -120,6 +126,25 @@ def render_cube_faces(viewport, camera: dict, size: int,
     return faces
 
 
+def render_camera_image(viewport, camera: dict, width: int = 192,
+                        height: int = 108, fov: float = 90.0):
+    """Render one temporary camera view and restore the viewport exactly."""
+    width = max(64, min(2048, int(width)))
+    height = max(64, min(2048, int(height)))
+    live = viewport.camera
+    saved = capture_view(live)
+    try:
+        preview_view(live, camera, fov=fov)
+        live.aspect = width / height
+        image = viewport.render_image(width, height, overlays=False)
+        if image is None or image.isNull():
+            raise RuntimeError("IngeTrazo could not render the camera preview")
+        return image.copy()
+    finally:
+        restore_view(live, saved)
+        viewport.update()
+
+
 def _rgba_array(image):
     """A detached ``height x width x 4`` uint8 array from a QImage."""
     import numpy as np
@@ -130,6 +155,66 @@ def _rgba_array(image):
     rows = raw.reshape(image.height(), image.bytesPerLine())
     return rows[:, :image.width() * 4].reshape(
         image.height(), image.width(), 4).copy()
+
+
+def prepare_equirectangular(image):
+    """Prepare a QImage once for fast interactive perspective views."""
+    return _rgba_array(image)
+
+
+def equirectangular_view(source, width: int, height: int, yaw: float = 0.0,
+                         pitch: float = 0.0, fov: float = 75.0):
+    """Project an equirectangular image into an ordinary draggable view.
+
+    ``yaw``, ``pitch`` and ``fov`` are degrees. ``source`` may be a QImage or
+    the array returned by :func:`prepare_equirectangular`.
+    """
+    import numpy as np
+    from PySide6.QtGui import QImage
+
+    src = _rgba_array(source) if isinstance(source, QImage) else source
+    if not isinstance(src, np.ndarray) or src.ndim != 3 or src.shape[2] != 4:
+        raise ValueError("an RGBA equirectangular image is required")
+    width = max(64, min(2048, int(width)))
+    height = max(64, min(2048, int(height)))
+    yaw = math.radians(float(yaw) % 360.0)
+    pitch = math.radians(max(-89.0, min(89.0, float(pitch))))
+    fov = math.radians(max(20.0, min(120.0, float(fov))))
+
+    aspect = width / height
+    half_y = math.tan(fov * 0.5)
+    half_x = half_y * aspect
+    x = (((np.arange(width, dtype=np.float32) + 0.5) / width) * 2.0 - 1.0)
+    y = (1.0 - ((np.arange(height, dtype=np.float32) + 0.5) /
+                height) * 2.0)
+    screen_x, screen_y = np.meshgrid(x * half_x, y * half_y)
+
+    cy, sy = math.cos(yaw), math.sin(yaw)
+    cp, sp = math.cos(pitch), math.sin(pitch)
+    # Basis in panorama coordinates: A front, B right, C up.
+    a = cp * cy + screen_x * -sy + screen_y * -sp * cy
+    b = cp * sy + screen_x * cy + screen_y * -sp * sy
+    c = sp + screen_y * cp
+    length = np.sqrt(a * a + b * b + c * c)
+    a, b, c = a / length, b / length, c / length
+    longitude = np.arctan2(b, a)
+    latitude = np.arcsin(np.clip(c, -1.0, 1.0))
+
+    src_h, src_w = src.shape[:2]
+    px = (longitude / (2.0 * np.pi) + 0.5) * src_w - 0.5
+    py = (0.5 - latitude / np.pi) * src_h - 0.5
+    x0 = np.floor(px).astype(np.int32) % src_w
+    x1 = (x0 + 1) % src_w
+    y0 = np.clip(np.floor(py).astype(np.int32), 0, src_h - 1)
+    y1 = np.minimum(y0 + 1, src_h - 1)
+    fx = (px - np.floor(px))[..., None]
+    fy = (py - np.floor(py))[..., None]
+    top = src[y0, x0] * (1.0 - fx) + src[y0, x1] * fx
+    bottom = src[y1, x0] * (1.0 - fx) + src[y1, x1] * fx
+    output = np.clip(top * (1.0 - fy) + bottom * fy, 0, 255).astype(np.uint8)
+    image = QImage(output.data, width, height, output.strides[0],
+                   QImage.Format_RGBA8888)
+    return image.copy()
 
 
 def cube_to_equirectangular(faces: dict, width: int,
@@ -195,6 +280,25 @@ def cube_to_equirectangular(faces: dict, width: int,
     return image.copy()
 
 
+def clean_export_settings(raw=None) -> dict:
+    """Return JSON-safe per-camera export settings with durable defaults."""
+    raw = raw if isinstance(raw, dict) else {}
+    projection = str(raw.get("projection", DEFAULT_EXPORT["projection"]))
+    if projection not in PROJECTIONS:
+        projection = DEFAULT_EXPORT["projection"]
+    fmt = str(raw.get("format", DEFAULT_EXPORT["format"])).lower()
+    if fmt not in FORMATS:
+        fmt = DEFAULT_EXPORT["format"]
+    try:
+        width = max(256, min(32768, int(raw.get(
+            "width", DEFAULT_EXPORT["width"]))))
+    except (TypeError, ValueError):
+        width = DEFAULT_EXPORT["width"]
+    folder = re.sub(r"[\x00-\x1f]", "", str(raw.get("folder", ""))).strip()
+    return {"projection": projection, "width": width, "format": fmt,
+            "folder": folder[:4096]}
+
+
 def clean_camera(raw, number: int = 1) -> dict | None:
     """Return one JSON-safe panorama camera, or ``None`` when malformed."""
     try:
@@ -212,6 +316,7 @@ def clean_camera(raw, number: int = 1) -> dict | None:
         "pos": pos,
         "heading": round(heading, 6),
         "tilt": round(tilt, 6),
+        "export": clean_export_settings(raw.get("export")),
     }
 
 
