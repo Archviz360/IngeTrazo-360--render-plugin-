@@ -23,6 +23,36 @@ FORMATS = {
 }
 CUBE_PROJECTIONS = frozenset(("cubemap_faces", "cubemap_strip",
                               "cubemap_cross"))
+_VIEW_FIELDS = ("distance", "yaw", "pitch", "fov_deg", "aspect", "znear",
+                "zfar", "perspective", "two_point")
+
+
+def capture_view(camera) -> dict:
+    """Return an independent snapshot of every mutable viewport view field."""
+    state = {name: getattr(camera, name) for name in _VIEW_FIELDS}
+    state["target"] = QVector3D(camera.target)
+    state["up"] = QVector3D(camera.up)
+    return state
+
+
+def restore_view(camera, state: dict) -> None:
+    """Restore a snapshot produced by :func:`capture_view` exactly."""
+    for name in _VIEW_FIELDS:
+        setattr(camera, name, state[name])
+    camera.target = QVector3D(state["target"])
+    camera.up = QVector3D(state["up"])
+
+
+def preview_view(camera, panorama: dict, fov: float = 90.0) -> None:
+    """Put an OrbitCamera at a saved panorama camera for live preview."""
+    panorama = clean_camera(panorama)
+    if panorama is None:
+        raise ValueError("invalid panorama camera")
+    camera.look_from(QVector3D(*panorama["pos"]), direction(panorama))
+    camera.up = QVector3D(0.0, 0.0, 1.0)
+    camera.perspective = True
+    camera.two_point = False
+    camera.fov_deg = max(1.0, min(179.0, float(fov)))
 
 
 def _set_view(camera, eye: QVector3D, forward: QVector3D,
@@ -55,10 +85,7 @@ def render_cube_faces(viewport, camera: dict, size: int,
         raise ValueError("invalid panorama camera")
     size = max(64, min(8192, int(size)))
     live = viewport.camera
-    fields = ("distance", "yaw", "pitch", "fov_deg", "aspect", "znear",
-              "zfar", "perspective", "two_point")
-    saved = {name: getattr(live, name) for name in fields}
-    saved["target"], saved["up"] = QVector3D(live.target), QVector3D(live.up)
+    saved = capture_view(live)
     eye = QVector3D(*camera["pos"])
     if auto_level:
         # A 360 panorama has no ordinary frame edge to hide a tilted horizon.
@@ -88,9 +115,7 @@ def render_cube_faces(viewport, camera: dict, size: int,
                 raise RuntimeError(f"IngeTrazo could not render cube face {name}")
             faces[name] = image.copy()
     finally:
-        for name in fields:
-            setattr(live, name, saved[name])
-        live.target, live.up = saved["target"], saved["up"]
+        restore_view(live, saved)
         viewport.update()
     return faces
 

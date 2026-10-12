@@ -100,6 +100,7 @@ class PanoramaPanel(QWidget):
         self._result = None
         self._view_pick = None
         self._picking = None
+        self._view_before_preview = None
         self._build_ui()
         self.refresh()
 
@@ -166,7 +167,7 @@ class PanoramaPanel(QWidget):
         self._tilt.setDecimals(1)
         self._tilt.setSuffix(" deg")
         self._tilt.setToolTip(tr(
-            "Used by Look through; 360 export levels the horizon automatically"))
+            "Used by camera preview; 360 export levels the horizon automatically"))
         self._tilt.editingFinished.connect(self._edited)
         form.addRow(tr("Tilt:"), self._tilt)
         self._eye_height = QDoubleSpinBox()
@@ -181,12 +182,26 @@ class PanoramaPanel(QWidget):
         move.clicked.connect(lambda: self._begin_pick("move"))
         aim = QPushButton(tr("Aim..."))
         aim.clicked.connect(lambda: self._begin_pick("aim"))
-        look = QPushButton(tr("Look through"))
-        look.clicked.connect(self._look_through)
         row.addWidget(move)
         row.addWidget(aim)
-        row.addWidget(look)
         form.addRow(row)
+        row = QHBoxLayout()
+        self._preview_button = QPushButton(tr("View camera preview"))
+        self._preview_button.setToolTip(tr(
+            "View from the selected camera with the 90-degree capture lens"))
+        self._preview_button.clicked.connect(self._start_preview)
+        self._normal_view_button = QPushButton(tr("Back to normal view"))
+        self._normal_view_button.setToolTip(tr(
+            "Restore the perspective view from before the camera preview"))
+        self._normal_view_button.clicked.connect(self._stop_preview)
+        self._normal_view_button.setEnabled(False)
+        row.addWidget(self._preview_button)
+        row.addWidget(self._normal_view_button)
+        form.addRow(row)
+        self._preview_status = QLabel(tr("Camera preview is off."))
+        self._preview_status.setWordWrap(True)
+        self._preview_status.setStyleSheet("color: palette(mid);")
+        form.addRow(self._preview_status)
         row = QHBoxLayout()
         update = QPushButton(tr("Update from view"))
         update.clicked.connect(self._update_from_view)
@@ -327,6 +342,10 @@ class PanoramaPanel(QWidget):
             self._tilt.setValue(cam["tilt"])
             for w in controls:
                 w.blockSignals(False)
+            if self._view_before_preview is not None:
+                self._apply_preview(cam)
+        elif self._view_before_preview is not None:
+            self._stop_preview()
         self.app.viewport.update()
 
     def _view_values(self):
@@ -368,6 +387,8 @@ class PanoramaPanel(QWidget):
         i = self.selected_index()
         if i is None:
             return
+        if self._view_before_preview is not None:
+            self._stop_preview()
         cams = self.cameras()
         del cams[i]
         _store(self.app, cams)
@@ -382,16 +403,35 @@ class PanoramaPanel(QWidget):
                    pos=[s.value() for s in self._xyz],
                    heading=self._heading.value(), tilt=self._tilt.value())
         _store(self.app, cams)
+        if self._view_before_preview is not None:
+            self._apply_preview(cam)
 
-    def _look_through(self):
+    def _apply_preview(self, cam):
+        pano.preview_view(self.app.viewport.camera, cam, fov=90.0)
+        self._preview_status.setText(tr(
+            "Previewing {name} with a 90-degree lens.", name=cam["name"]))
+        self.app.viewport.update()
+        self.app.viewport.setFocus()
+
+    def _start_preview(self):
         cam = self.selected_camera()
         if cam is None:
             return
-        view = self.app.viewport.camera
-        view.look_from(QVector3D(*cam["pos"]), pano.direction(cam))
-        view.perspective = True
-        view.two_point = False
+        if self._view_before_preview is None:
+            self._view_before_preview = pano.capture_view(
+                self.app.viewport.camera)
+        self._normal_view_button.setEnabled(True)
+        self._apply_preview(cam)
+
+    def _stop_preview(self):
+        if self._view_before_preview is None:
+            return
+        pano.restore_view(self.app.viewport.camera, self._view_before_preview)
+        self._view_before_preview = None
+        self._normal_view_button.setEnabled(False)
+        self._preview_status.setText(tr("Camera preview is off."))
         self.app.viewport.update()
+        self.app.viewport.setFocus()
 
     def _begin_pick(self, purpose):
         if purpose != "new" and self.selected_camera() is None:
@@ -637,6 +677,8 @@ class PanoramaPanel(QWidget):
 
 
 def draw_cameras(panel, viewport, painter):
+    if panel._view_before_preview is not None:
+        return
     cams = panel.cameras()
     selected = panel.selected_index()
     painter.setRenderHint(QPainter.Antialiasing)

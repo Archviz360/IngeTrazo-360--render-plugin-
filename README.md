@@ -23,7 +23,9 @@ D.S (Archviz360)
 - Persistent 360 cameras saved inside the `.igz` document
 - Create a camera from the current view
 - Place cameras on the model with snapping and configurable eye height
-- Move, aim, rename, duplicate, delete, and look through cameras
+- Move, aim, rename, duplicate, and delete cameras
+- Preview the selected camera through its 90° capture lens
+- Return from camera preview to the exact previous perspective view
 - Export one camera or batch-export every camera
 - Equirectangular 360° output at 2K–16K
 - PNG and JPEG output
@@ -80,8 +82,10 @@ Restart IngeTrazo afterward.
 3. Choose **From view** to create a camera at the current viewpoint, or
    **Place…** to click a floor position in the model.
 4. Use **Aim…** to choose the center direction of the panorama.
-5. Select an equirectangular or cubemap projection and resolution.
-6. Press **Export selected 360…**.
+5. Press **View camera preview** to inspect the selected camera. Press
+   **Back to normal view** to restore your previous viewport perspective.
+6. Select an equirectangular or cubemap projection and resolution.
+7. Press **Export selected 360…**.
 
 Equirectangular exports are standard 2:1 images—for example, 4096×2048.
 The horizon is leveled automatically during export, even if the saved camera

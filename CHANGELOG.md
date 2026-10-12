@@ -1,5 +1,13 @@
 # Changelog
 
+## 2.3.0
+
+- Added a live 90-degree preview from the selected 360 camera.
+- Added a **Back to normal view** control that restores the exact viewport
+  position, direction, lens, and projection used before previewing.
+- Switching the selected saved camera updates the active preview directly.
+- Camera markers are hidden while previewing for a clean image view.
+
 ## 2.2.0
 
 - Added the supplied high-contrast red Archviz360 logo as the 360 Export
