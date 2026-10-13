@@ -82,6 +82,9 @@ Restart IngeTrazo afterward.
 
 ## Usage
 
+For a complete illustrated walkthrough, see the
+**[Native 360 Export User Guide](docs/USER_GUIDE.md)**.
+
 1. Open a model in IngeTrazo.
 2. Click the **360 Export** logo button, or select
    **Extensions → Export 360 images…**. Drag the button's toolbar handle to
